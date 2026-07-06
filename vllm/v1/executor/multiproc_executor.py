@@ -735,11 +735,13 @@ class WorkerProc:
                     )
                 except EOFError:
                     proc = unready_proc_handle.proc
+                    proc.join(timeout=1.0)
                     failure_msg = (
                         "WorkerProc exited before READY and did not send a "
                         "Python traceback over ready_pipe: "
                         f"rank={unready_proc_handle.rank}, "
-                        f"pid={proc.pid}, exitcode={proc.exitcode}. "
+                        f"pid={proc.pid}, exitcode={proc.exitcode}, "
+                        f"is_alive={proc.is_alive()}. "
                         "Check worker stdout/stderr, dmesg, or native runtime logs."
                     )
                     logger.error(failure_msg)
@@ -920,6 +922,46 @@ class WorkerProc:
         except SystemExit as e:
             # SystemExit is raised on SIGTERM or SIGKILL, which usually indicates that
             # the graceful shutdown process did not succeed
+            if ready_writer is not None:
+                rank = kwargs.get("rank", "unknown")
+                local_rank = kwargs.get("local_rank", "unknown")
+                pid = os.getpid()
+                tb = traceback.format_exc()
+                diag_path = (
+                    f"/tmp/vllm_worker_startup_rank{rank}_pid{pid}_system_exit.log"
+                )
+                try:
+                    with open(diag_path, "w", encoding="utf-8") as f:
+                        f.write(
+                            "WorkerProc exited with SystemExit before READY\n"
+                            f"rank={rank}\n"
+                            f"local_rank={local_rank}\n"
+                            f"pid={pid}\n"
+                            f"exception={repr(e)}\n\n"
+                            f"{tb}"
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to write WorkerProc SystemExit diagnostic file."
+                    )
+                    diag_path = None
+
+                try:
+                    ready_writer.send(
+                        {
+                            "status": "FAILED",
+                            "rank": rank,
+                            "local_rank": local_rank,
+                            "pid": pid,
+                            "diag_path": diag_path,
+                            "exception": repr(e),
+                            "traceback": tb,
+                        }
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to send WorkerProc SystemExit details."
+                    )
             logger.warning("WorkerProc was terminated")
             # SystemExit must never be ignored
             raise e
