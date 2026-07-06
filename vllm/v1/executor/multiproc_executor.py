@@ -702,11 +702,6 @@ class WorkerProc:
     def wait_for_ready(
         unready_proc_handles: list[UnreadyWorkerProcHandle],
     ) -> list[WorkerProcHandle]:
-        e = Exception(
-            "WorkerProc initialization failed due to an exception in a "
-            "background process. See stack trace for root cause."
-        )
-
         pipes = {handle.ready_pipe: handle for handle in unready_proc_handles}
         ready_proc_handles: list[WorkerProcHandle | None] = [None] * len(
             unready_proc_handles
@@ -720,15 +715,35 @@ class WorkerProc:
                     unready_proc_handle = pipes.pop(pipe)
                     response: dict[str, Any] = pipe.recv()
                     if response["status"] != "READY":
-                        raise e
+                        failure_msg = (
+                            "WorkerProc failed to start before READY: "
+                            f"rank={response.get('rank')}, "
+                            f"local_rank={response.get('local_rank')}, "
+                            f"pid={response.get('pid')}, "
+                            f"diag_path={response.get('diag_path')}, "
+                            f"exception={response.get('exception')}"
+                        )
+                        tb = response.get("traceback")
+                        if tb:
+                            failure_msg += f"\nWorker startup traceback:\n{tb}"
+                        logger.error(failure_msg)
+                        raise Exception(failure_msg)
 
                     idx = unready_proc_handle.rank % len(ready_proc_handles)
                     ready_proc_handles[idx] = WorkerProc.wait_for_response_handle_ready(
                         response, unready_proc_handle
                     )
                 except EOFError:
-                    e.__suppress_context__ = True
-                    raise e from None
+                    proc = unready_proc_handle.proc
+                    failure_msg = (
+                        "WorkerProc exited before READY and did not send a "
+                        "Python traceback over ready_pipe: "
+                        f"rank={unready_proc_handle.rank}, "
+                        f"pid={proc.pid}, exitcode={proc.exitcode}. "
+                        "Check worker stdout/stderr, dmesg, or native runtime logs."
+                    )
+                    logger.error(failure_msg)
+                    raise Exception(failure_msg) from None
 
                 finally:
                     # Close connection.
@@ -842,14 +857,56 @@ class WorkerProc:
 
             worker.worker_busy_loop()
 
-        except Exception:
+        except Exception as exc:
             # NOTE: if an Exception arises in busy_loop, we send
             # a FAILURE message over the MQ RPC to notify the Executor,
             # which triggers system shutdown.
             # TODO(rob): handle case where the MQ itself breaks.
 
             if ready_writer is not None:
-                logger.exception("WorkerProc failed to start.")
+                rank = kwargs.get("rank", "unknown")
+                local_rank = kwargs.get("local_rank", "unknown")
+                pid = os.getpid()
+                tb = traceback.format_exc()
+                diag_path = (
+                    f"/tmp/vllm_worker_startup_rank{rank}_pid{pid}.log"
+                )
+                try:
+                    with open(diag_path, "w", encoding="utf-8") as f:
+                        f.write(
+                            "WorkerProc failed to start before READY\n"
+                            f"rank={rank}\n"
+                            f"local_rank={local_rank}\n"
+                            f"pid={pid}\n"
+                            f"exception={repr(exc)}\n\n"
+                            f"{tb}"
+                        )
+                except Exception:
+                    logger.exception(
+                        "Failed to write WorkerProc startup diagnostic file."
+                    )
+                    diag_path = None
+
+                logger.exception(
+                    "WorkerProc failed to start. Startup traceback file: %s",
+                    diag_path,
+                )
+                try:
+                    ready_writer.send(
+                        {
+                            "status": "FAILED",
+                            "rank": rank,
+                            "local_rank": local_rank,
+                            "pid": pid,
+                            "diag_path": diag_path,
+                            "exception": repr(exc),
+                            "traceback": tb,
+                        }
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to send WorkerProc startup failure details."
+                    )
             elif shutdown_requested.is_set():
                 logger.info("WorkerProc shutting down.")
             else:
