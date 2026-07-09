@@ -39,6 +39,11 @@ def _decode_window_save_window_size() -> int:
         return 0
 
 
+def _dsa_admission_diag_verbose() -> bool:
+    raw = os.getenv("VLLM_ASCEND_DSA_ADMISSION_DIAG_VERBOSE")
+    return raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -69,6 +74,7 @@ class SingleTypeKVCacheManager(ABC):
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
         self.enable_caching = enable_caching
+        self._dsa_admission_diag_verbose = _dsa_admission_diag_verbose()
         self.new_block_ids: list[int] = []
 
         # Mapping from request ID to blocks to track the blocks allocated
@@ -511,12 +517,33 @@ class DSALatentManager(FullAttentionManager):
         total_computed_tokens: int,
         num_prompt_tokens: int | None = None,
     ) -> None:
-        if _decode_window_save_window_size() > 0:
+        decode_window_size = _decode_window_save_window_size()
+        if decode_window_size > 0:
             # The prefill tail belongs to the first saved decode window. In
             # decode-window mode, only free latent blocks after LMCache reports
             # that a window save has completed.
+            if self._dsa_admission_diag_verbose:
+                logger.info(
+                    "[DSA_LATENT_RELEASE_SKIP] req=%s "
+                    "reason=decode_window_mode window_size=%d "
+                    "total_computed=%d prompt=%s scratch_blocks=%d",
+                    request_id,
+                    decode_window_size,
+                    total_computed_tokens,
+                    num_prompt_tokens,
+                    self.scratch_blocks,
+                )
             return
         if num_prompt_tokens is None or total_computed_tokens < num_prompt_tokens:
+            if self._dsa_admission_diag_verbose:
+                logger.info(
+                    "[DSA_LATENT_RELEASE_SKIP] req=%s reason=prefill_not_done "
+                    "total_computed=%d prompt=%s scratch_blocks=%d",
+                    request_id,
+                    total_computed_tokens,
+                    num_prompt_tokens,
+                    self.scratch_blocks,
+                )
             # still prefilling — full prefix latent must stay resident
             return
         blocks = self.req_to_blocks[request_id]
@@ -527,6 +554,16 @@ class DSALatentManager(FullAttentionManager):
         end = min(num_prompt_tokens // self.block_size, len(blocks))
         end = (end // blocks_per_bundle) * blocks_per_bundle
         if end <= start or blocks[start] == self._null_block:
+            if self._dsa_admission_diag_verbose:
+                logger.info(
+                    "[DSA_LATENT_RELEASE_SKIP] req=%s reason=nothing_to_free "
+                    "start=%d end=%d len_blocks=%d scratch_blocks=%d",
+                    request_id,
+                    start,
+                    end,
+                    len(blocks),
+                    self.scratch_blocks,
+                )
             # nothing to free, or already shrunk (idempotent fast path)
             return
         removed_blocks: list[KVCacheBlock] = []
@@ -562,6 +599,17 @@ class DSALatentManager(FullAttentionManager):
         end = min(saved_end // self.block_size, len(blocks))
         end = (end // blocks_per_bundle) * blocks_per_bundle
         if end <= start:
+            if self._dsa_admission_diag_verbose:
+                logger.info(
+                    "[DECODE_WINDOW_RELEASE_SKIP] req=%s "
+                    "reason=window_before_scratch saved_end=%d start=%d "
+                    "end=%d scratch_blocks=%d",
+                    request_id,
+                    saved_end,
+                    start,
+                    end,
+                    self.scratch_blocks,
+                )
             return 0
 
         removed_blocks: list[KVCacheBlock] = []

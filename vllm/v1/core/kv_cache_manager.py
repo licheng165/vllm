@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
@@ -16,6 +17,16 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+def _dsa_admission_diag_enabled() -> bool:
+    raw = os.getenv("VLLM_ASCEND_DSA_ADMISSION_DIAG")
+    return raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dsa_admission_diag_verbose() -> bool:
+    raw = os.getenv("VLLM_ASCEND_DSA_ADMISSION_DIAG_VERBOSE")
+    return raw is not None and raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -123,6 +134,10 @@ class KVCacheManager:
         self.use_eagle = use_eagle
         self.log_stats = log_stats
         self.metrics_collector = metrics_collector
+        self._dsa_admission_diag = _dsa_admission_diag_enabled()
+        self._dsa_admission_diag_verbose = (
+            self._dsa_admission_diag and _dsa_admission_diag_verbose()
+        )
         # FIXME: make prefix cache stats conditional on log_stats. We still need
         # this comment because when the log stats is enabled there are still
         # potential configs we could expose in the future.
@@ -325,6 +340,28 @@ class KVCacheManager:
             num_tokens_main_model + num_lookahead_tokens,
             self.max_model_len,
         )
+        if self._dsa_admission_diag_verbose:
+            logger.info(
+                "[KV_ALLOC_INPUT] req=%s prompt=%d request_tokens=%d "
+                "computed_before=%d new_local_hit=%d external_hit=%d "
+                "total_computed=%d new_tokens=%d lookahead=%d "
+                "main_model_tokens=%d need_slot_tokens=%d max_model_len=%d "
+                "delay_cache_blocks=%s encoder_tokens=%d",
+                request.request_id,
+                request.num_prompt_tokens,
+                request.num_tokens,
+                request.num_computed_tokens,
+                num_new_computed_tokens,
+                num_external_computed_tokens,
+                total_computed_tokens,
+                num_new_tokens,
+                num_lookahead_tokens,
+                num_tokens_main_model,
+                num_tokens_need_slot,
+                self.max_model_len,
+                delay_cache_blocks,
+                num_encoder_tokens,
+            )
 
         # Free the blocks that are skipped during the attention computation
         # (e.g., tokens outside the sliding window).
@@ -349,6 +386,26 @@ class KVCacheManager:
         ):
             # Cannot allocate new blocks (with per-group block pools, every
             # group's demand must fit its own pool).
+            if self._dsa_admission_diag:
+                logger.info(
+                    "[KV_ALLOC_BLOCKED] req=%s prompt=%d request_tokens=%d "
+                    "computed_before=%d new_local_hit=%d external_hit=%d "
+                    "total_computed=%d new_tokens=%d lookahead=%d "
+                    "main_model_tokens=%d need_slot_tokens=%d "
+                    "delay_cache_blocks=%s",
+                    request.request_id,
+                    request.num_prompt_tokens,
+                    request.num_tokens,
+                    request.num_computed_tokens,
+                    num_new_computed_tokens,
+                    num_external_computed_tokens,
+                    total_computed_tokens,
+                    num_new_tokens,
+                    num_lookahead_tokens,
+                    num_tokens_main_model,
+                    num_tokens_need_slot,
+                    delay_cache_blocks,
+                )
             return None
 
         if (
@@ -370,6 +427,16 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
         )
+        if self._dsa_admission_diag_verbose:
+            logger.info(
+                "[KV_ALLOC_OK] req=%s new_block_counts=%s "
+                "need_slot_tokens=%d main_model_tokens=%d total_computed=%d",
+                request.request_id,
+                [len(group) for group in new_blocks],
+                num_tokens_need_slot,
+                num_tokens_main_model,
+                total_computed_tokens,
+            )
 
         # P/D: delay caching blocks if we have to recv from
         # remote. Update state for locally cached blocks.

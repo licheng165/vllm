@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -66,6 +67,24 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using %s.", name, raw, default)
+        return default
 
 
 class Scheduler(SchedulerInterface):
@@ -288,6 +307,39 @@ class Scheduler(SchedulerInterface):
             )
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+        self._dsa_admission_diag = _env_flag(
+            "VLLM_ASCEND_DSA_ADMISSION_DIAG"
+        )
+        self._dsa_admission_diag_verbose = self._dsa_admission_diag and _env_flag(
+            "VLLM_ASCEND_DSA_ADMISSION_DIAG_VERBOSE"
+        )
+        self._dsa_admission_diag_interval = _env_float(
+            "VLLM_ASCEND_DSA_ADMISSION_DIAG_INTERVAL", 1.0
+        )
+        self._dsa_admission_diag_last_summary = 0.0
+        self._dsa_admission_diag_step = 0
+
+    def _should_log_dsa_admission_summary(self, now: float) -> bool:
+        if not self._dsa_admission_diag:
+            return False
+        if self._dsa_admission_diag_interval <= 0:
+            self._dsa_admission_diag_last_summary = now
+            return True
+        if now - self._dsa_admission_diag_last_summary < (
+            self._dsa_admission_diag_interval
+        ):
+            return False
+        self._dsa_admission_diag_last_summary = now
+        return True
+
+    def _log_dsa_admission_diag(
+        self, message: str, *args: object, verbose: bool = False
+    ) -> None:
+        if not self._dsa_admission_diag:
+            return
+        if verbose and not self._dsa_admission_diag_verbose:
+            return
+        logger.info(message, *args)
 
     def _mamba_block_aligned_split(
         self,
@@ -359,9 +411,15 @@ class Scheduler(SchedulerInterface):
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
+        token_budget_start = token_budget
+        running_count_start = len(self.running)
+        waiting_count_start = len(self.waiting) + len(self.skipped_waiting)
+        schedule_stop_reason: str | None = None
+        self._dsa_admission_diag_step += 1
         if self._pause_state == PauseState.PAUSED_ALL:
             # Do not schedule any requests when paused.
             token_budget = 0
+            schedule_stop_reason = "paused_all"
 
         # Encoder-related.
         scheduled_encoder_inputs: dict[str, list[int]] = {}
@@ -371,6 +429,21 @@ class Scheduler(SchedulerInterface):
 
         # For logging.
         scheduled_timestamp = time.monotonic()
+        self._log_dsa_admission_diag(
+            "[DSA_ADMISSION_START] step=%d running=%d/%d waiting=%d "
+            "token_budget=%d max_model_len=%d block_size=%d spec_tokens=%d "
+            "lookahead_tokens=%d",
+            self._dsa_admission_diag_step,
+            running_count_start,
+            self.max_num_running_reqs,
+            waiting_count_start,
+            token_budget,
+            self.max_model_len,
+            self.block_size,
+            self.num_spec_tokens,
+            self.num_lookahead_tokens,
+            verbose=True,
+        )
 
         self.kv_cache_manager.new_step_starts()
 
@@ -451,6 +524,27 @@ class Scheduler(SchedulerInterface):
                 req_index += 1
                 continue
 
+            self._log_dsa_admission_diag(
+                "[DSA_ADMISSION_RUNNING_TRY] step=%d req=%s "
+                "computed=%d prompt=%d tokens=%d tokens_with_spec=%d "
+                "placeholders=%d spec_ids=%d new_tokens=%d lookahead=%d "
+                "token_budget_before=%d running=%d/%d",
+                self._dsa_admission_diag_step,
+                request.request_id,
+                request.num_computed_tokens,
+                request.num_prompt_tokens,
+                request.num_tokens,
+                request.num_tokens_with_spec,
+                request.num_output_placeholders,
+                len(request.spec_token_ids),
+                num_new_tokens,
+                self.num_lookahead_tokens,
+                token_budget,
+                len(self.running),
+                self.max_num_running_reqs,
+                verbose=True,
+            )
+
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
@@ -501,6 +595,20 @@ class Scheduler(SchedulerInterface):
 
             if new_blocks is None:
                 # Cannot schedule this request.
+                schedule_stop_reason = (
+                    f"running_kv_admission_blocked:req={request.request_id}"
+                )
+                self._log_dsa_admission_diag(
+                    "[DSA_ADMISSION_RUNNING_BLOCKED] step=%d req=%s "
+                    "new_tokens=%d lookahead=%d token_budget=%d running=%d/%d",
+                    self._dsa_admission_diag_step,
+                    request.request_id,
+                    num_new_tokens,
+                    self.num_lookahead_tokens,
+                    token_budget,
+                    len(self.running),
+                    self.max_num_running_reqs,
+                )
                 break
 
             # Schedule the request.
@@ -509,6 +617,17 @@ class Scheduler(SchedulerInterface):
             req_to_new_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
+            self._log_dsa_admission_diag(
+                "[DSA_ADMISSION_RUNNING_OK] step=%d req=%s "
+                "scheduled_tokens=%d token_budget_after=%d running=%d/%d",
+                self._dsa_admission_diag_step,
+                request_id,
+                num_new_tokens,
+                token_budget,
+                len(self.running),
+                self.max_num_running_reqs,
+                verbose=True,
+            )
             req_index += 1
 
             # Speculative decode related.
@@ -560,6 +679,16 @@ class Scheduler(SchedulerInterface):
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
+                    schedule_stop_reason = "max_num_seqs"
+                    self._log_dsa_admission_diag(
+                        "[DSA_ADMISSION_STOP] step=%d reason=max_num_seqs "
+                        "running=%d/%d waiting=%d token_budget=%d",
+                        self._dsa_admission_diag_step,
+                        len(self.running),
+                        self.max_num_running_reqs,
+                        len(self.waiting) + len(self.skipped_waiting),
+                        token_budget,
+                    )
                     break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
@@ -577,6 +706,18 @@ class Scheduler(SchedulerInterface):
                             "%s is still in WAITING_FOR_REMOTE_KVS state.",
                             request_id,
                         )
+                        self._log_dsa_admission_diag(
+                            "[DSA_ADMISSION_WAITING_SKIP] step=%d req=%s "
+                            "reason=waiting_for_remote_kv computed=%d "
+                            "external=%d prompt=%d tokens=%d",
+                            self._dsa_admission_diag_step,
+                            request_id,
+                            request.num_computed_tokens,
+                            request.num_external_computed_tokens,
+                            request.num_prompt_tokens,
+                            request.num_tokens,
+                            verbose=True,
+                        )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -592,6 +733,15 @@ class Scheduler(SchedulerInterface):
                     )
                 ):
                     # Scheduling would exceed max_loras, skip.
+                    self._log_dsa_admission_diag(
+                        "[DSA_ADMISSION_WAITING_SKIP] step=%d req=%s "
+                        "reason=max_loras running=%d/%d",
+                        self._dsa_admission_diag_step,
+                        request_id,
+                        len(self.running),
+                        self.max_num_running_reqs,
+                        verbose=True,
+                    )
                     request_queue.pop_request()
                     step_skipped_waiting.prepend_request(request)
                     continue
@@ -619,6 +769,16 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled because
                             # the KVConnector couldn't determine
                             # the number of matched tokens.
+                            self._log_dsa_admission_diag(
+                                "[DSA_ADMISSION_WAITING_SKIP] step=%d req=%s "
+                                "reason=connector_ext_tokens_unknown "
+                                "local_hit=%d prompt=%d tokens=%d",
+                                self._dsa_admission_diag_step,
+                                request_id,
+                                num_new_local_computed_tokens,
+                                request.num_prompt_tokens,
+                                request.num_tokens,
+                            )
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
@@ -669,6 +829,27 @@ class Scheduler(SchedulerInterface):
                     ):
                         # If chunked_prefill is disabled,
                         # we can stop the scheduling here.
+                        schedule_stop_reason = (
+                            "token_budget_prefill_chunking_disabled:"
+                            f"req={request_id}:need={num_new_tokens}:"
+                            f"budget={token_budget}"
+                        )
+                        self._log_dsa_admission_diag(
+                            "[DSA_ADMISSION_STOP] step=%d "
+                            "reason=token_budget_prefill_chunking_disabled "
+                            "req=%s need_tokens=%d token_budget=%d "
+                            "computed=%d local_hit=%d external_hit=%d "
+                            "prompt=%d tokens=%d",
+                            self._dsa_admission_diag_step,
+                            request_id,
+                            num_new_tokens,
+                            token_budget,
+                            num_computed_tokens,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                            request.num_prompt_tokens,
+                            request.num_tokens,
+                        )
                         break
 
                     num_new_tokens = min(num_new_tokens, token_budget)
@@ -690,6 +871,9 @@ class Scheduler(SchedulerInterface):
                         )
                         if num_new_tokens == 0:
                             # The request cannot be scheduled.
+                            schedule_stop_reason = (
+                                f"encoder_budget_exhausted:req={request_id}"
+                            )
                             break
 
                 if self.need_mamba_block_aligned_split:
@@ -700,6 +884,9 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens,
                     )
                     if num_new_tokens == 0:
+                        schedule_stop_reason = (
+                            f"mamba_block_align_no_budget:req={request_id}"
+                        )
                         break
 
                 # Handles an edge case when P/D Disaggregation
@@ -723,6 +910,30 @@ class Scheduler(SchedulerInterface):
                         for i in encoder_inputs_to_schedule
                     )
 
+                self._log_dsa_admission_diag(
+                    "[DSA_ADMISSION_WAITING_TRY] step=%d req=%s "
+                    "status=%s running=%d/%d token_budget_before=%d "
+                    "prompt=%d tokens=%d computed=%d local_hit=%d "
+                    "external_hit=%d load_kv_async=%s new_tokens=%d "
+                    "lookahead=%d encoder_tokens=%d",
+                    self._dsa_admission_diag_step,
+                    request_id,
+                    request.status.name,
+                    len(self.running),
+                    self.max_num_running_reqs,
+                    token_budget,
+                    request.num_prompt_tokens,
+                    request.num_tokens,
+                    num_computed_tokens,
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                    load_kv_async,
+                    num_new_tokens,
+                    effective_lookahead_tokens,
+                    num_encoder_tokens,
+                    verbose=True,
+                )
+
                 new_blocks = self.kv_cache_manager.allocate_slots(
                     request,
                     num_new_tokens,
@@ -736,6 +947,27 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    schedule_stop_reason = f"waiting_kv_admission_blocked:req={request_id}"
+                    self._log_dsa_admission_diag(
+                        "[DSA_ADMISSION_WAITING_BLOCKED] step=%d req=%s "
+                        "reason=kv_admission running=%d/%d token_budget=%d "
+                        "prompt=%d tokens=%d computed=%d local_hit=%d "
+                        "external_hit=%d load_kv_async=%s new_tokens=%d "
+                        "lookahead=%d",
+                        self._dsa_admission_diag_step,
+                        request_id,
+                        len(self.running),
+                        self.max_num_running_reqs,
+                        token_budget,
+                        request.num_prompt_tokens,
+                        request.num_tokens,
+                        num_computed_tokens,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
+                        load_kv_async,
+                        num_new_tokens,
+                        effective_lookahead_tokens,
+                    )
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -783,6 +1015,20 @@ class Scheduler(SchedulerInterface):
                     # _update_waiting_for_remote_kv will then cache
                     # only the successfully loaded tokens.
                     request.num_computed_tokens = num_computed_tokens
+                    self._log_dsa_admission_diag(
+                        "[DSA_ADMISSION_REMOTE_WAIT] step=%d req=%s "
+                        "external_hit=%d local_hit=%d computed=%d "
+                        "prompt=%d tokens=%d running=%d/%d",
+                        self._dsa_admission_diag_step,
+                        request_id,
+                        num_external_computed_tokens,
+                        num_new_local_computed_tokens,
+                        num_computed_tokens,
+                        request.num_prompt_tokens,
+                        request.num_tokens,
+                        len(self.running),
+                        self.max_num_running_reqs,
+                    )
                     continue
 
                 self.running.append(request)
@@ -806,6 +1052,22 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                self._log_dsa_admission_diag(
+                    "[DSA_ADMISSION_ADMIT] step=%d req=%s running_after=%d/%d "
+                    "scheduled_tokens=%d token_budget_after=%d computed=%d "
+                    "local_hit=%d external_hit=%d prompt=%d tokens=%d",
+                    self._dsa_admission_diag_step,
+                    request_id,
+                    len(self.running),
+                    self.max_num_running_reqs,
+                    num_new_tokens,
+                    token_budget,
+                    num_computed_tokens,
+                    num_new_local_computed_tokens,
+                    num_external_computed_tokens,
+                    request.num_prompt_tokens,
+                    request.num_tokens,
+                )
                 # Count the number of prefix cached tokens.
                 num_cached_tokens = min(
                     num_computed_tokens, request.num_prompt_tokens
@@ -839,6 +1101,47 @@ class Scheduler(SchedulerInterface):
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())
         assert total_num_scheduled_tokens <= self.max_num_scheduled_tokens
+
+        if schedule_stop_reason is None:
+            if token_budget <= 0 and (self.waiting or self.skipped_waiting):
+                schedule_stop_reason = "token_budget_exhausted"
+            elif len(self.running) == self.max_num_running_reqs:
+                schedule_stop_reason = "max_num_seqs"
+            elif self.waiting or self.skipped_waiting:
+                schedule_stop_reason = "waiting_not_schedulable_this_step"
+            else:
+                schedule_stop_reason = "no_waiting_requests"
+
+        summary_timestamp = time.monotonic()
+        if self._should_log_dsa_admission_summary(summary_timestamp):
+            logger.info(
+                "[DSA_ADMISSION_SUMMARY] step=%d running_before=%d "
+                "running_after=%d max_running=%d waiting_before=%d "
+                "waiting_after=%d scheduled_running=%d admitted_new=%d "
+                "admitted_resumed=%d preempted=%d token_budget_start=%d "
+                "scheduled_tokens=%d token_budget_left=%d max_scheduled_tokens=%d "
+                "max_model_len=%d block_size=%d spec_tokens=%d lookahead=%d "
+                "stop_reason=%s",
+                self._dsa_admission_diag_step,
+                running_count_start,
+                len(self.running),
+                self.max_num_running_reqs,
+                waiting_count_start,
+                len(self.waiting) + len(self.skipped_waiting),
+                len(scheduled_running_reqs),
+                len(scheduled_new_reqs),
+                len(scheduled_resumed_reqs),
+                len(preempted_reqs),
+                token_budget_start,
+                total_num_scheduled_tokens,
+                token_budget,
+                self.max_num_scheduled_tokens,
+                self.max_model_len,
+                self.block_size,
+                self.num_spec_tokens,
+                self.num_lookahead_tokens,
+                schedule_stop_reason,
+            )
 
         assert token_budget >= 0
         assert len(self.running) <= self.max_num_running_reqs
@@ -2084,6 +2387,17 @@ class Scheduler(SchedulerInterface):
                     request.num_cached_tokens, num_cached_tokens
                 )
 
+        self._log_dsa_admission_diag(
+            "[DSA_ADMISSION_REMOTE_PROMOTE] req=%s failed=%s computed=%d "
+            "external=%d cached=%d prompt=%d tokens=%d",
+            request.request_id,
+            failed_recv,
+            request.num_computed_tokens,
+            request.num_external_computed_tokens,
+            request.num_cached_tokens,
+            request.num_prompt_tokens,
+            request.num_tokens,
+        )
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
     def _try_promote_blocked_waiting_request(self, request: Request) -> bool:
@@ -2150,12 +2464,32 @@ class Scheduler(SchedulerInterface):
                     req_id,
                     saved_end,
                 )
+            self._log_dsa_admission_diag(
+                "[DSA_ADMISSION_DECODE_WINDOW_SAVE] req=%s saved_end=%d "
+                "removed_latent_blocks=%d running=%d waiting=%d",
+                req_id,
+                saved_end,
+                removed_blocks,
+                len(self.running),
+                len(self.waiting) + len(self.skipped_waiting),
+            )
 
         # KV Connector:: update recv and send status from last step.
         for req_id in kv_connector_output.finished_recving or ():
             logger.debug("Finished recving KV transfer for request %s", req_id)
             assert req_id in self.requests
             req = self.requests[req_id]
+            self._log_dsa_admission_diag(
+                "[DSA_ADMISSION_REMOTE_RECV_DONE] req=%s status=%s "
+                "computed=%d external=%d cached=%d prompt=%d tokens=%d",
+                req_id,
+                req.status.name,
+                req.num_computed_tokens,
+                req.num_external_computed_tokens,
+                req.num_cached_tokens,
+                req.num_prompt_tokens,
+                req.num_tokens,
+            )
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 self.finished_recving_kv_req_ids.add(req_id)
             else:

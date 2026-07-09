@@ -56,6 +56,27 @@ def _get_dsa_pool_log_interval() -> float:
         return 5.0
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _dsa_admission_diag_enabled() -> bool:
+    return _env_flag("VLLM_ASCEND_DSA_ADMISSION_DIAG")
+
+
+def _dsa_admission_diag_verbose() -> bool:
+    return _env_flag("VLLM_ASCEND_DSA_ADMISSION_DIAG_VERBOSE")
+
+
+def _fit_count(free: int, needed: int) -> str:
+    if needed <= 0:
+        return "inf"
+    return str(free // needed)
+
+
 class KVCacheCoordinator(ABC):
     """
     Coordinate the KV cache of different KV cache groups.
@@ -79,6 +100,10 @@ class KVCacheCoordinator(ABC):
         self._dsa_pool_last_log = 0.0
         self._dsa_pool_log_interval = _get_dsa_pool_log_interval()
         self._dsa_last_starve: tuple[str, int, int, list[int]] | None = None
+        self._dsa_admission_diag = _dsa_admission_diag_enabled()
+        self._dsa_admission_diag_verbose = (
+            self._dsa_admission_diag and _dsa_admission_diag_verbose()
+        )
 
         # DSA two-group mode has two variants:
         # 1. legacy: one real BlockPool per group;
@@ -284,6 +309,37 @@ class KVCacheCoordinator(ABC):
                 )
         return num_blocks_to_allocate
 
+    def _format_admission_group_parts(
+        self,
+        request_id: str,
+        per_group: list[int],
+        frees: list[int],
+    ) -> str:
+        parts = []
+        for i, (needed, free, manager) in enumerate(
+            zip(per_group, frees, self.single_type_managers)
+        ):
+            spec = getattr(manager, "kv_cache_spec", None)
+            page = getattr(spec, "page_size_bytes", "?")
+            owner = getattr(getattr(manager, "block_pool", None), "owner", None)
+            owner_name = getattr(owner, "value", None) or "shared"
+            req_blocks = manager.req_to_blocks.get(request_id, ())
+            resident_blocks = sum(1 for block in req_blocks if not block.is_null)
+            bundle_need = "-"
+            blocks_per_bundle = getattr(manager.block_pool, "blocks_per_bundle", None)
+            if hasattr(manager.block_pool, "get_num_bundles_to_allocate"):
+                bundle_need = str(manager.block_pool.get_num_bundles_to_allocate(needed))
+            flag = " BLOCKED" if needed > free else ""
+            parts.append(
+                f"g{i}:{type(manager).__name__}/owner={owner_name}"
+                f"/page={page}/block={manager.block_size}"
+                f" need={needed} free={free} fit_more={_fit_count(free, needed)}"
+                f" resident={resident_blocks} req_table={len(req_blocks)}"
+                f" bundles_need={bundle_need}"
+                f" blocks_per_bundle={blocks_per_bundle}{flag}"
+            )
+        return " | ".join(parts)
+
     def has_enough_free_blocks(
         self,
         request_id: str,
@@ -307,6 +363,25 @@ class KVCacheCoordinator(ABC):
         if self.use_per_group_block_pools:
             frees = [m.block_pool.get_num_free_blocks() for m in self.single_type_managers]
             ok = all(needed <= free for needed, free in zip(per_group, frees))
+            if self._dsa_admission_diag and (
+                self._dsa_admission_diag_verbose or not ok
+            ):
+                logger.info(
+                    "[KV_ADMISSION] req=%s mode=per_group ok=%s "
+                    "need_slot_tokens=%d main_model_tokens=%d "
+                    "total_computed_tokens=%d encoder_tokens=%d groups=[%s]",
+                    request_id,
+                    ok,
+                    num_tokens,
+                    num_tokens_main_model,
+                    total_computed_tokens,
+                    num_encoder_tokens,
+                    self._format_admission_group_parts(
+                        request_id,
+                        per_group,
+                        frees,
+                    ),
+                )
             if not ok and (time.monotonic() - _last_starve_log[0]) > 1.0:
                 # [KVSTARVE] one-per-second snapshot of WHICH group blocked an
                 # admission, with each group's demand vs free blocks. The group(s)
@@ -328,6 +403,10 @@ class KVCacheCoordinator(ABC):
                 )
             return ok
         if self.use_dsa_shared_block_pool:
+            frees = [
+                manager.block_pool.get_num_free_blocks()
+                for manager in self.single_type_managers
+            ]
             needed_bundles = sum(
                 manager.block_pool.get_num_bundles_to_allocate(needed)
                 for manager, needed in zip(self.single_type_managers, per_group)
@@ -340,6 +419,36 @@ class KVCacheCoordinator(ABC):
                     self.dsa_shared_allocator.free_bundle_count,
                     per_group,
                 )
+            if self._dsa_admission_diag and (
+                self._dsa_admission_diag_verbose or not ok
+            ):
+                logger.info(
+                    "[KV_ADMISSION] req=%s mode=dsa_shared ok=%s "
+                    "need_slot_tokens=%d main_model_tokens=%d "
+                    "total_computed_tokens=%d encoder_tokens=%d "
+                    "need_bundles=%d free_bundles=%d "
+                    "fit_more_by_bundles=%s largest_free_range=%d "
+                    "free_ranges=%d groups=[%s]",
+                    request_id,
+                    ok,
+                    num_tokens,
+                    num_tokens_main_model,
+                    total_computed_tokens,
+                    num_encoder_tokens,
+                    needed_bundles,
+                    self.dsa_shared_allocator.free_bundle_count,
+                    _fit_count(
+                        self.dsa_shared_allocator.free_bundle_count,
+                        needed_bundles,
+                    ),
+                    self.dsa_shared_allocator.largest_free_range,
+                    self.dsa_shared_allocator.free_range_count,
+                    self._format_admission_group_parts(
+                        request_id,
+                        per_group,
+                        frees,
+                    ),
+                )
             if not ok and (time.monotonic() - _last_starve_log[0]) > 1.0:
                 _last_starve_log[0] = time.monotonic()
                 logger.info(
@@ -351,7 +460,33 @@ class KVCacheCoordinator(ABC):
                     per_group,
             )
             return ok
-        return sum(per_group) <= self.block_pool.get_num_free_blocks()
+        free_blocks = self.block_pool.get_num_free_blocks()
+        needed_blocks = sum(per_group)
+        ok = needed_blocks <= free_blocks
+        if self._dsa_admission_diag and (
+            self._dsa_admission_diag_verbose or not ok
+        ):
+            logger.info(
+                "[KV_ADMISSION] req=%s mode=single_pool ok=%s "
+                "need_slot_tokens=%d main_model_tokens=%d "
+                "total_computed_tokens=%d encoder_tokens=%d "
+                "need_blocks=%d free_blocks=%d fit_more=%s groups=[%s]",
+                request_id,
+                ok,
+                num_tokens,
+                num_tokens_main_model,
+                total_computed_tokens,
+                num_encoder_tokens,
+                needed_blocks,
+                free_blocks,
+                _fit_count(free_blocks, needed_blocks),
+                self._format_admission_group_parts(
+                    request_id,
+                    per_group,
+                    [free_blocks] * len(per_group),
+                ),
+            )
+        return ok
 
     def maybe_log_dsa_shared_pool_usage(
         self,
