@@ -2133,22 +2133,22 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
 
-        for req_id, saved_end in (
+        for req_id, committed_end in (
             kv_connector_output.completed_decode_window_saves.items()
         ):
             if req_id not in self.requests:
                 continue
-            removed_blocks = self.kv_cache_manager.remove_saved_decode_window_blocks(
+            removed_blocks = self.kv_cache_manager.remove_committed_blocks(
                 req_id,
-                saved_end,
+                committed_end,
             )
             if removed_blocks:
                 logger.debug(
-                    "Released %d DSA latent blocks for completed decode "
-                    "window save: request=%s saved_end=%d",
+                    "Released %d DSA latent blocks for completed LMCache "
+                    "commit: request=%s committed_end=%d",
                     removed_blocks,
                     req_id,
-                    saved_end,
+                    committed_end,
                 )
 
         # KV Connector:: update recv and send status from last step.

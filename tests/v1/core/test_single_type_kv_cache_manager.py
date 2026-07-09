@@ -336,7 +336,7 @@ def test_sliding_window_remove_skipped_blocks():
     assert_block_id(block_table, [null_block_id] * 4 + original_block_ids[4:])
 
 
-def test_dsa_latent_decode_window_release_waits_for_completed_save(monkeypatch):
+def test_dsa_latent_release_uses_committed_boundary():
     attention_spec = MLAAttentionSpec(
         block_size=2,
         num_kv_heads=1,
@@ -366,20 +366,33 @@ def test_dsa_latent_decode_window_release_waits_for_completed_save(monkeypatch):
     block_table = id_to_block_table(original_block_ids)
     manager.req_to_blocks["test"] = block_table
 
-    monkeypatch.setenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "4")
-    manager.remove_skipped_blocks("test", total_computed_tokens=6, num_prompt_tokens=4)
+    manager.remove_skipped_blocks("test", total_computed_tokens=6)
     assert_block_id(block_table, original_block_ids)
 
-    assert manager.remove_saved_decode_window_blocks("test", saved_end=4) == 0
+    assert manager.remove_committed_blocks("test", committed_end=4) == 0
     assert_block_id(block_table, original_block_ids)
 
-    assert manager.remove_saved_decode_window_blocks("test", saved_end=8) == 2
+    assert manager.remove_committed_blocks("test", committed_end=8) == 2
     assert_block_id(
         block_table,
         original_block_ids[:2]
         + [null_block_id, null_block_id]
         + original_block_ids[4:],
     )
+
+
+def test_dsa_latent_release_requires_aligned_boundary():
+    attention_spec = MLAAttentionSpec(
+        block_size=2,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float32,
+    )
+    block_pool = BlockPool(num_gpu_blocks=2000, enable_caching=True, hash_block_size=2)
+    manager = get_dsa_latent_manager(attention_spec, block_pool)
+
+    with pytest.raises(AssertionError, match="block aligned"):
+        manager.remove_committed_blocks("test", committed_end=3)
 
 
 def test_get_num_blocks_to_allocate():

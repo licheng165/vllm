@@ -150,8 +150,8 @@ class KVConnectorOutput:
     # IDs of externally computed KV blocks that failed to load.
     # Requests referencing these blocks should be rescheduled to recompute them
     invalid_block_ids: set[int] = field(default_factory=set)
-    # req_id -> token end offset for decode windows that were saved to the
-    # external KV connector and can be evicted from the local latent KV cache.
+    # req_id -> committed token boundary saved to the external KV connector
+    # and eligible for local DSA latent KV release.
     completed_decode_window_saves: dict[str, int] = field(default_factory=dict)
     # Configuration describing how many finished sending/receiving
     # notifications should be expected for each request. This allows
@@ -194,10 +194,10 @@ class KVConnectorOutput:
         assert invalid_block_ids is not None
         completed_decode_window_saves: dict[str, int] = {}
         for output in outputs:
-            for req_id, window_end in output.completed_decode_window_saves.items():
+            for req_id, boundary in output.completed_decode_window_saves.items():
                 completed_decode_window_saves[req_id] = max(
                     completed_decode_window_saves.get(req_id, 0),
-                    window_end,
+                    boundary,
                 )
 
         assert all(

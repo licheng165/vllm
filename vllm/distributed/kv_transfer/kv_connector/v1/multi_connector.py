@@ -316,8 +316,8 @@ class MultiConnector(KVConnectorBase_V1):
             get_completed = getattr(c, "get_completed_decode_window_saves", None)
             if get_completed is None:
                 continue
-            for req_id, window_end in get_completed().items():
-                completed[req_id] = max(completed.get(req_id, 0), window_end)
+            for req_id, boundary in get_completed().items():
+                completed[req_id] = max(completed.get(req_id, 0), boundary)
         return completed
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):

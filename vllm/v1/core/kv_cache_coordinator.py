@@ -599,7 +599,6 @@ class KVCacheCoordinator(ABC):
         self,
         request_id: str,
         total_computed_tokens: int,
-        num_prompt_tokens: int | None = None,
     ) -> None:
         """
         Remove the blocks that are no longer needed from `blocks` and replace
@@ -609,27 +608,20 @@ class KVCacheCoordinator(ABC):
             request_id: The request ID.
             total_computed_tokens: The total number of computed tokens, including
                 local computed tokens and external computed tokens.
-            num_prompt_tokens: prompt length; only consumed by DSALatentManager
-                (frees the prefill latent at end of prefill).
         """
         for manager in self.single_type_managers:
-            if isinstance(manager, DSALatentManager):
-                manager.remove_skipped_blocks(
-                    request_id, total_computed_tokens, num_prompt_tokens
-                )
-            else:
-                manager.remove_skipped_blocks(request_id, total_computed_tokens)
+            manager.remove_skipped_blocks(request_id, total_computed_tokens)
 
-    def remove_saved_decode_window_blocks(
+    def remove_committed_blocks(
         self,
         request_id: str,
-        saved_end: int,
+        committed_end: int,
     ) -> int:
         removed_blocks = 0
         for manager in self.single_type_managers:
             if isinstance(manager, DSALatentManager):
-                removed_blocks += manager.remove_saved_decode_window_blocks(
-                    request_id, saved_end
+                removed_blocks += manager.remove_committed_blocks(
+                    request_id, committed_end
                 )
         return removed_blocks
 

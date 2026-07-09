@@ -335,7 +335,6 @@ class KVCacheManager:
         self.coordinator.remove_skipped_blocks(
             request.request_id,
             total_computed_tokens,
-            num_prompt_tokens=request.num_prompt_tokens,
         )
 
         if not self.coordinator.has_enough_free_blocks(
@@ -412,14 +411,14 @@ class KVCacheManager:
         """
         self.coordinator.remove_skipped_blocks(request_id, total_computed_tokens)
 
-    def remove_saved_decode_window_blocks(
+    def remove_committed_blocks(
         self,
         request_id: str,
-        saved_end: int,
+        committed_end: int,
     ) -> int:
-        """Free DSA latent blocks covered by a completed decode-window save."""
-        return self.coordinator.remove_saved_decode_window_blocks(
-            request_id, saved_end
+        """Free DSA latent blocks covered by a completed LMCache commit."""
+        return self.coordinator.remove_committed_blocks(
+            request_id, committed_end
         )
 
     def evict_blocks(self, block_ids: set[int]) -> None:

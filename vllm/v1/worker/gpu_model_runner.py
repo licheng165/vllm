@@ -4048,14 +4048,14 @@ class GPUModelRunner(
             if completed_decode_window_saves:
                 if self.kv_connector_output is None:
                     self.kv_connector_output = KVConnectorOutput()
-                for req_id, window_end in completed_decode_window_saves.items():
+                for req_id, boundary in completed_decode_window_saves.items():
                     self.kv_connector_output.completed_decode_window_saves[
                         req_id
                     ] = max(
                         self.kv_connector_output.completed_decode_window_saves.get(
                             req_id, 0
                         ),
-                        window_end,
+                        boundary,
                     )
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):

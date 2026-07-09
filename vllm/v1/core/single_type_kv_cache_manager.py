@@ -30,15 +30,6 @@ from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
-
-def _decode_window_save_window_size() -> int:
-    raw = os.getenv("LMCACHE_DECODE_WINDOW_SAVE_WINDOW_SIZE", "0")
-    try:
-        return max(int(raw), 0)
-    except ValueError:
-        return 0
-
-
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -494,73 +485,53 @@ class FullAttentionManager(SingleTypeKVCacheManager):
 class DSALatentManager(FullAttentionManager):
     """DSA shrink-latent (stage 2): manager for the MLA latent group.
 
-    At the end of prefill (total computed >= prompt length) the request's
-    prefill latent has been offloaded to LMCache and decode reads only the
-    compact scratch (enough blocks for `index_topk`, installed as the instance
-    `scratch_blocks` by KVCacheCoordinator) plus the in-place decode-position
-    tail blocks. So free the middle range [scratch_blocks ..
-    prompt_len // block_size) back to the latent pool, replacing the entries
-    with null_block (so request finish won't double-free).
+    Decode reads LMCache-backed positions through compact scratch slots at the
+    start of the request's latent block table, and reads uncommitted positions
+    in place from later blocks. Blocks below the LMCache boundary are kept only
+    up to the scratch capacity needed for that boundary; fully committed blocks
+    after that scratch window can be released.
     """
 
     scratch_blocks = int(os.getenv("VLLM_ASCEND_DSA_SCRATCH_BLOCKS", "16"))
+
+    def _scratch_keep_blocks(self, boundary_tokens: int) -> int:
+        """Number of leading blocks that must remain available as scratch."""
+        boundary_blocks = boundary_tokens // self.block_size
+        keep_blocks = min(self.scratch_blocks, boundary_blocks)
+        blocks_per_bundle = getattr(self.block_pool, "blocks_per_bundle", 1)
+        return cdiv(keep_blocks, blocks_per_bundle) * blocks_per_bundle
 
     def remove_skipped_blocks(
         self,
         request_id: str,
         total_computed_tokens: int,
-        num_prompt_tokens: int | None = None,
     ) -> None:
-        if _decode_window_save_window_size() > 0:
-            # The prefill tail belongs to the first saved decode window. In
-            # decode-window mode, only free latent blocks after LMCache reports
-            # that a window save has completed.
-            return
-        if num_prompt_tokens is None or total_computed_tokens < num_prompt_tokens:
-            # still prefilling — full prefix latent must stay resident
-            return
-        blocks = self.req_to_blocks[request_id]
-        blocks_per_bundle = getattr(self.block_pool, "blocks_per_bundle", 1)
-        start = cdiv(self.scratch_blocks, blocks_per_bundle) * blocks_per_bundle
-        # never free the boundary block: with a non-multiple prompt length it
-        # also holds the first decode positions
-        end = min(num_prompt_tokens // self.block_size, len(blocks))
-        end = (end // blocks_per_bundle) * blocks_per_bundle
-        if end <= start or blocks[start] == self._null_block:
-            # nothing to free, or already shrunk (idempotent fast path)
-            return
-        removed_blocks: list[KVCacheBlock] = []
-        for i in range(end - 1, start - 1, -1):
-            if blocks[i] == self._null_block:
-                break
-            removed_blocks.append(blocks[i])
-            blocks[i] = self._null_block
-        self.block_pool.free_blocks(removed_blocks)
-        if removed_blocks:
-            logger.info(
-                "[DSA_SHRINK] req=%s freed_latent_blocks=%d keep_blocks=%d "
-                "prompt_blocks=%d",
-                request_id,
-                len(removed_blocks),
-                start,
-                end,
-            )
+        # DSA latent release is keyed only by LMCache committed_end. Prefill
+        # completion and decode-window saves both report that boundary through
+        # KVConnectorOutput.completed_decode_window_saves, which the scheduler
+        # forwards to remove_committed_blocks().
+        return
 
-    def remove_saved_decode_window_blocks(
+    def remove_committed_blocks(
         self,
         request_id: str,
-        saved_end: int,
+        committed_end: int,
     ) -> int:
-        if saved_end <= 0:
+        if committed_end <= 0:
             return 0
+        assert committed_end % self.block_size == 0, (
+            "DSA committed boundary must be block aligned: "
+            f"request_id={request_id} committed_end={committed_end} "
+            f"block_size={self.block_size}"
+        )
         blocks = self.req_to_blocks.get(request_id)
         if not blocks:
             return 0
 
         blocks_per_bundle = getattr(self.block_pool, "blocks_per_bundle", 1)
-        start = cdiv(self.scratch_blocks, blocks_per_bundle) * blocks_per_bundle
-        end = min(saved_end // self.block_size, len(blocks))
+        end = min(committed_end // self.block_size, len(blocks))
         end = (end // blocks_per_bundle) * blocks_per_bundle
+        start = min(self._scratch_keep_blocks(committed_end), end)
         if end <= start:
             return 0
 
@@ -573,10 +544,10 @@ class DSALatentManager(FullAttentionManager):
         self.block_pool.free_blocks(removed_blocks)
         if removed_blocks:
             logger.info(
-                "[DECODE_WINDOW_RELEASE] req=%s saved_end=%d "
+                "[DSA_COMMIT_RELEASE] req=%s committed_end=%d "
                 "freed_latent_blocks=%d keep_blocks=%d release_blocks=%d",
                 request_id,
-                saved_end,
+                committed_end,
                 len(removed_blocks),
                 start,
                 end,

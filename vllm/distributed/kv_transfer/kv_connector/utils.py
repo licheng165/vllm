@@ -156,10 +156,10 @@ class KVOutputAggregator:
                 combined_kv_cache_events.increment_workers(1)
 
             invalid_block_ids |= kv_output.invalid_block_ids
-            for req_id, window_end in kv_output.completed_decode_window_saves.items():
+            for req_id, boundary in kv_output.completed_decode_window_saves.items():
                 completed_decode_window_saves[req_id] = max(
                     completed_decode_window_saves.get(req_id, 0),
-                    window_end,
+                    boundary,
                 )
 
         # select output of the worker specified by output_rank
