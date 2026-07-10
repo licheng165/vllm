@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import os
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -11,6 +12,7 @@ import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
+from vllm.logger import init_logger
 from vllm.outputs import (
     STREAM_FINISHED,
     CompletionOutput,
@@ -38,8 +40,19 @@ from vllm.v1.metrics.stats import (
     SchedulerStats,
 )
 
+logger = init_logger(__name__)
+
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
+
+
+def _decode_window_save_text_debug_enabled() -> bool:
+    return os.getenv("VLLM_DSA_DECODE_WINDOW_SAVE_TEXT_DEBUG", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 class RequestOutputCollector:
@@ -569,11 +582,28 @@ class OutputProcessor:
             # Queue the streaming update otherwise.
             req_state.input_chunk_queue.append(update)
 
+    def _log_decode_window_save_text(
+        self,
+        req_id: str,
+        req_state: RequestState,
+        committed_end: int,
+    ) -> None:
+        output_text = ""
+        if req_state.detokenizer is not None:
+            output_text = req_state.detokenizer.output_text
+        logger.info(
+            "[DSA_DECODE_WINDOW_SAVE_TEXT] req=%s committed_end=%d output_text=%r",
+            req_id,
+            committed_end,
+            output_text,
+        )
+
     def process_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
+        completed_decode_window_saves: dict[str, int] | None = None,
     ) -> OutputProcessorOutput:
         """
         Process the EngineCoreOutputs:
@@ -599,6 +629,12 @@ class OutputProcessor:
 
         request_outputs: list[RequestOutput | PoolingRequestOutput] = []
         reqs_to_abort: list[str] = []
+        completed_decode_window_saves = completed_decode_window_saves or {}
+        should_log_decode_window_save = (
+            bool(completed_decode_window_saves)
+            and _decode_window_save_text_debug_enabled()
+        )
+        logged_decode_window_save_reqs: set[str] = set()
         for engine_core_output in engine_core_outputs:
             req_id = engine_core_output.request_id
             req_state = self.request_states.get(req_id)
@@ -634,6 +670,12 @@ class OutputProcessor:
                 # 3) Compute sample and prompt logprobs for request,
                 # if required.
                 req_state.logprobs_processor.update_from_output(engine_core_output)
+
+            if should_log_decode_window_save and (
+                committed_end := completed_decode_window_saves.get(req_id)
+            ) is not None:
+                self._log_decode_window_save_text(req_id, req_state, committed_end)
+                logged_decode_window_save_reqs.add(req_id)
 
             # 4) Create and handle RequestOutput objects.
             if request_output := req_state.make_request_output(
@@ -675,6 +717,16 @@ class OutputProcessor:
                     )
                     if self.tracing_enabled:
                         self.do_tracing(engine_core_output, req_state, iteration_stats)
+
+        if should_log_decode_window_save:
+            for req_id, committed_end in completed_decode_window_saves.items():
+                if req_id in logged_decode_window_save_reqs:
+                    continue
+                req_state = self.request_states.get(req_id)
+                if req_state is not None:
+                    self._log_decode_window_save_text(
+                        req_id, req_state, committed_end
+                    )
 
         return OutputProcessorOutput(
             request_outputs=request_outputs,

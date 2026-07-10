@@ -1488,6 +1488,19 @@ class Scheduler(SchedulerInterface):
                     )
                 )
 
+        completed_decode_window_saves_by_client: dict[int, dict[str, int]] = (
+            defaultdict(dict)
+        )
+        if kv_connector_output:
+            for req_id, committed_end in (
+                kv_connector_output.completed_decode_window_saves.items()
+            ):
+                request = self.requests.get(req_id)
+                if request is not None:
+                    completed_decode_window_saves_by_client[request.client_index][
+                        req_id
+                    ] = committed_end
+
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
@@ -1541,6 +1554,17 @@ class Scheduler(SchedulerInterface):
                 # outputs this step.
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
+
+        for client_index, completed in completed_decode_window_saves_by_client.items():
+            if not completed:
+                continue
+            eco = engine_core_outputs.get(client_index)
+            if eco is None:
+                engine_core_outputs[client_index] = EngineCoreOutputs(
+                    completed_decode_window_saves=completed
+                )
+            else:
+                eco.completed_decode_window_saves.update(completed)
 
         return engine_core_outputs
 

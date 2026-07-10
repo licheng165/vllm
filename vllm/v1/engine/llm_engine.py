@@ -308,6 +308,7 @@ class LLMEngine:
                 outputs.outputs,
                 engine_core_timestamp=outputs.timestamp,
                 iteration_stats=iteration_stats,
+                completed_decode_window_saves=outputs.completed_decode_window_saves,
             )
             self.output_processor.update_scheduler_stats(outputs.scheduler_stats)
 

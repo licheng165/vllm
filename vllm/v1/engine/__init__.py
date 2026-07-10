@@ -208,6 +208,7 @@ class EngineCoreOutputs(
     # In DP case, used to signal that a request was received for an
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
+    completed_decode_window_saves: dict[str, int] = {}
 
     def __post_init__(self):
         if self.timestamp == 0.0:

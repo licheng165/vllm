@@ -671,12 +671,32 @@ class AsyncLLM(EngineClient):
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
                     # event loop for too long.
                     engine_core_outputs = outputs.outputs
+                    completed_decode_window_saves = (
+                        outputs.completed_decode_window_saves
+                    )
+                    logged_decode_window_save_reqs: set[str] = set()
                     for start in range(0, num_outputs, chunk_size):
                         end = start + chunk_size
                         outputs_slice = engine_core_outputs[start:end]
+                        completed_slice = None
+                        if completed_decode_window_saves:
+                            slice_req_ids = {
+                                output.request_id for output in outputs_slice
+                            }
+                            completed_slice = {
+                                req_id: committed_end
+                                for req_id, committed_end in (
+                                    completed_decode_window_saves.items()
+                                )
+                                if req_id in slice_req_ids
+                            }
+                            logged_decode_window_save_reqs.update(completed_slice)
                         # 2) Process EngineCoreOutputs.
                         processed_outputs = output_processor.process_outputs(
-                            outputs_slice, outputs.timestamp, iteration_stats
+                            outputs_slice,
+                            outputs.timestamp,
+                            iteration_stats,
+                            completed_slice,
                         )
                         # NOTE: RequestOutputs are pushed to their queues.
                         assert not processed_outputs.request_outputs
@@ -689,6 +709,22 @@ class AsyncLLM(EngineClient):
                         if processed_outputs.reqs_to_abort:
                             await engine_core.abort_requests_async(
                                 processed_outputs.reqs_to_abort
+                            )
+
+                    if completed_decode_window_saves:
+                        remaining_completed = {
+                            req_id: committed_end
+                            for req_id, committed_end in (
+                                completed_decode_window_saves.items()
+                            )
+                            if req_id not in logged_decode_window_save_reqs
+                        }
+                        if remaining_completed:
+                            output_processor.process_outputs(
+                                [],
+                                outputs.timestamp,
+                                iteration_stats,
+                                remaining_completed,
                             )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
