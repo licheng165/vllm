@@ -79,6 +79,22 @@ logger = init_logger(__name__)
 
 HANDSHAKE_TIMEOUT_MINS = 5
 
+_PD_STAGE_TRACE_ENABLED = os.environ.get("VLLM_PD_STAGE_TRACE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+try:
+    _PD_STAGE_TRACE_EVERY = max(
+        1, int(os.environ.get("VLLM_PD_STAGE_TRACE_EVERY", "1"))
+    )
+except ValueError:
+    _PD_STAGE_TRACE_EVERY = 1
+_PD_STAGE_TRACE_REQUEST_ID = os.environ.get(
+    "VLLM_PD_STAGE_TRACE_REQUEST_ID", ""
+)
+
 _R = TypeVar("_R")  # Return type for collective_rpc
 
 
@@ -375,6 +391,53 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def _start_pd_stage_trace(
+        self, scheduler_output: SchedulerOutput, step_started_ns: int
+    ) -> dict[str, Any] | None:
+        if not _PD_STAGE_TRACE_ENABLED:
+            return None
+
+        step_id = getattr(self, "_pd_stage_trace_step", 0)
+        self._pd_stage_trace_step = step_id + 1
+        if step_id % _PD_STAGE_TRACE_EVERY:
+            return None
+
+        request_ids = list(scheduler_output.num_scheduled_tokens)
+        if (
+            _PD_STAGE_TRACE_REQUEST_ID
+            and _PD_STAGE_TRACE_REQUEST_ID not in request_ids
+        ):
+            return None
+
+        cached = scheduler_output.scheduled_cached_reqs
+        computed_by_req = dict(
+            zip(cached.req_ids, cached.num_computed_tokens, strict=True)
+        )
+        output_by_req = dict(
+            zip(cached.req_ids, cached.num_output_tokens, strict=True)
+        )
+        for request in scheduler_output.scheduled_new_reqs:
+            computed_by_req[request.req_id] = request.num_computed_tokens
+            output_by_req[request.req_id] = 0
+
+        request_parts = []
+        for request_id in request_ids[:8]:
+            phase = "decode" if output_by_req.get(request_id, 0) > 0 else "prefill"
+            request_parts.append(
+                f"{request_id}:phase={phase}:scheduled="
+                f"{scheduler_output.num_scheduled_tokens[request_id]}:computed="
+                f"{computed_by_req.get(request_id, -1)}:output="
+                f"{output_by_req.get(request_id, -1)}"
+            )
+        if len(request_ids) > 8:
+            request_parts.append(f"...+{len(request_ids) - 8}")
+
+        return {
+            "step_id": step_id,
+            "step_started_ns": step_started_ns,
+            "requests": ";".join(request_parts) or "none",
+        }
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -386,23 +449,59 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+
+        step_started_ns = time.perf_counter_ns()
+        schedule_started_ns = step_started_ns
         scheduler_output = self.scheduler.schedule()
+        schedule_done_ns = time.perf_counter_ns()
+        pd_trace = self._start_pd_stage_trace(scheduler_output, step_started_ns)
+
+        execute_dispatch_started_ns = schedule_done_ns
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        execute_dispatch_done_ns = time.perf_counter_ns()
+
+        grammar_started_ns = execute_dispatch_done_ns
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        grammar_done_ns = time.perf_counter_ns()
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
         ):
+            execute_wait_started_ns = grammar_done_ns
             model_output = future.result()
+            execute_wait_done_ns = time.perf_counter_ns()
+            sample_started_ns = execute_wait_done_ns
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+            sample_done_ns = time.perf_counter_ns()
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
+        update_started_ns = time.perf_counter_ns()
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        step_done_ns = time.perf_counter_ns()
+
+        if pd_trace is not None:
+            to_ms = lambda elapsed_ns: elapsed_ns / 1_000_000
+            logger.info(
+                "[PD_STAGE_TRACE] scope=engine step=%d requests=%s "
+                "scheduled_tokens=%d schedule_ms=%.3f dispatch_ms=%.3f "
+                "grammar_ms=%.3f execute_wait_ms=%.3f sample_ms=%.3f "
+                "update_ms=%.3f total_ms=%.3f",
+                pd_trace["step_id"],
+                pd_trace["requests"],
+                scheduler_output.total_num_scheduled_tokens,
+                to_ms(schedule_done_ns - schedule_started_ns),
+                to_ms(execute_dispatch_done_ns - execute_dispatch_started_ns),
+                to_ms(grammar_done_ns - grammar_started_ns),
+                to_ms(execute_wait_done_ns - execute_wait_started_ns),
+                to_ms(sample_done_ns - sample_started_ns),
+                to_ms(step_done_ns - update_started_ns),
+                to_ms(step_done_ns - pd_trace["step_started_ns"]),
+            )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -444,11 +543,32 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
+            schedule_started_ns = time.perf_counter_ns()
             scheduler_output = self.scheduler.schedule()
+            schedule_done_ns = time.perf_counter_ns()
+            pd_trace = self._start_pd_stage_trace(
+                scheduler_output, schedule_started_ns
+            )
+            if pd_trace is not None:
+                pd_trace["schedule_ms"] = (
+                    schedule_done_ns - schedule_started_ns
+                ) / 1_000_000
+                traces = getattr(self, "_pd_stage_batch_queue_traces", None)
+                if traces is None:
+                    traces = {}
+                    self._pd_stage_batch_queue_traces = traces
+                traces[id(scheduler_output)] = pd_trace
+
+            dispatch_started_ns = schedule_done_ns
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            dispatch_done_ns = time.perf_counter_ns()
+            if pd_trace is not None:
+                pd_trace["dispatch_ms"] = (
+                    dispatch_done_ns - dispatch_started_ns
+                ) / 1_000_000
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -459,12 +579,18 @@ class EngineCore:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
+                    grammar_started_ns = time.perf_counter_ns()
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
+                    grammar_done_ns = time.perf_counter_ns()
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
+                    if pd_trace is not None:
+                        pd_trace["grammar_ms"] = (
+                            grammar_done_ns - grammar_started_ns
+                        ) / 1_000_000
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
@@ -472,6 +598,8 @@ class EngineCore:
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
+                if pd_trace is not None:
+                    pd_trace["queue_enqueued_ns"] = time.perf_counter_ns()
                 batch_queue.appendleft((future, scheduler_output, exec_future))
                 if (
                     model_executed
@@ -490,6 +618,9 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        traces = getattr(self, "_pd_stage_batch_queue_traces", {})
+        completed_trace = traces.pop(id(scheduler_output), None)
+        result_wait_started_ns = time.perf_counter_ns()
         with (
             self.log_error_detail(scheduler_output),
             self.log_iteration_details(scheduler_output),
@@ -500,13 +631,39 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        result_wait_done_ns = time.perf_counter_ns()
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
+        update_started_ns = result_wait_done_ns
         self._process_aborts_queue()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        update_done_ns = time.perf_counter_ns()
+
+        if completed_trace is not None:
+            queue_enqueued_ns = completed_trace.get(
+                "queue_enqueued_ns", completed_trace["step_started_ns"]
+            )
+            logger.info(
+                "[PD_STAGE_TRACE] scope=engine_batch_queue step=%d requests=%s "
+                "scheduled_tokens=%d schedule_ms=%.3f dispatch_ms=%.3f "
+                "grammar_ms=%.3f submit_to_dequeue_ms=%.3f "
+                "result_wait_ms=%.3f update_ms=%.3f total_ms=%.3f",
+                completed_trace["step_id"],
+                completed_trace["requests"],
+                scheduler_output.total_num_scheduled_tokens,
+                completed_trace.get("schedule_ms", 0.0),
+                completed_trace.get("dispatch_ms", 0.0),
+                completed_trace.get("grammar_ms", 0.0),
+                (result_wait_started_ns - queue_enqueued_ns) / 1_000_000,
+                (result_wait_done_ns - result_wait_started_ns) / 1_000_000,
+                (update_done_ns - update_started_ns) / 1_000_000,
+                (
+                    update_done_ns - completed_trace["step_started_ns"]
+                ) / 1_000_000,
+            )
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -526,10 +683,18 @@ class EngineCore:
                 )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
+            deferred_trace = traces.get(id(deferred_scheduler_output))
+            grammar_started_ns = time.perf_counter_ns()
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
+            grammar_done_ns = time.perf_counter_ns()
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+            if deferred_trace is not None:
+                deferred_trace["grammar_ms"] = (
+                    grammar_done_ns - grammar_started_ns
+                ) / 1_000_000
+                deferred_trace["queue_enqueued_ns"] = time.perf_counter_ns()
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
@@ -1453,6 +1618,7 @@ class EngineCoreProc(EngineCore):
                 else None
             )
             max_reuse_bufs = len(sockets) + 1
+            pd_output_step = 0
 
             while True:
                 output = self.output_queue.get()
@@ -1471,15 +1637,58 @@ class EngineCoreProc(EngineCore):
                     coord_socket.send_multipart(encoder.encode(outputs))
                     continue
 
+                request_ids = [output.request_id for output in outputs.outputs]
+                output_step = pd_output_step
+                if request_ids:
+                    pd_output_step += 1
+                trace_output = (
+                    _PD_STAGE_TRACE_ENABLED
+                    and bool(request_ids)
+                    and output_step % _PD_STAGE_TRACE_EVERY == 0
+                    and (
+                        not _PD_STAGE_TRACE_REQUEST_ID
+                        or _PD_STAGE_TRACE_REQUEST_ID in request_ids
+                    )
+                )
+                output_started_ns = (
+                    time.perf_counter_ns() if trace_output else 0
+                )
+                queue_ms = (
+                    (time.monotonic() - outputs.timestamp) * 1000
+                    if trace_output and outputs.timestamp
+                    else 0.0
+                )
                 # Reclaim buffers that zmq is finished with.
                 while pending and pending[-1][0].done:
                     reuse_buffers.append(pending.pop()[2])
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
+                encode_started_ns = (
+                    time.perf_counter_ns() if trace_output else 0
+                )
                 buffers = encoder.encode_into(outputs, buffer)
+                encode_done_ns = (
+                    time.perf_counter_ns() if trace_output else 0
+                )
                 tracker = sockets[client_index].send_multipart(
                     buffers, copy=False, track=True
                 )
+                send_done_ns = (
+                    time.perf_counter_ns() if trace_output else 0
+                )
+                if trace_output:
+                    logger.info(
+                        "[PD_STAGE_TRACE] scope=output step=%d requests=%s "
+                        "queue_ms=%.3f encode_ms=%.3f send_submit_ms=%.3f "
+                        "total_ms=%.3f send_pending=%s",
+                        output_step,
+                        ";".join(request_ids[:8]) or "none",
+                        queue_ms,
+                        (encode_done_ns - encode_started_ns) / 1_000_000,
+                        (send_done_ns - encode_done_ns) / 1_000_000,
+                        (send_done_ns - output_started_ns) / 1_000_000,
+                        not tracker.done,
+                    )
                 if not tracker.done:
                     ref = outputs if len(buffers) > 1 else None
                     pending.appendleft((tracker, ref, buffer))

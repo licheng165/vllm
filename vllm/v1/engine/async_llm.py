@@ -55,6 +55,22 @@ from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
 
+_PD_STAGE_TRACE_ENABLED = os.environ.get("VLLM_PD_STAGE_TRACE", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+try:
+    _PD_STAGE_TRACE_EVERY = max(
+        1, int(os.environ.get("VLLM_PD_STAGE_TRACE_EVERY", "1"))
+    )
+except ValueError:
+    _PD_STAGE_TRACE_EVERY = 1
+_PD_STAGE_TRACE_REQUEST_ID = os.environ.get(
+    "VLLM_PD_STAGE_TRACE_REQUEST_ID", ""
+)
+
 
 class InputStreamError(Exception):
     """Wrapper for errors from the input stream generator.
@@ -657,11 +673,33 @@ class AsyncLLM(EngineClient):
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
 
         async def output_handler():
+            pd_frontend_step = 0
             try:
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
                     num_outputs = len(outputs.outputs)
+                    request_ids = [output.request_id for output in outputs.outputs]
+                    frontend_step = pd_frontend_step
+                    if request_ids:
+                        pd_frontend_step += 1
+                    trace_output = (
+                        _PD_STAGE_TRACE_ENABLED
+                        and bool(request_ids)
+                        and frontend_step % _PD_STAGE_TRACE_EVERY == 0
+                        and (
+                            not _PD_STAGE_TRACE_REQUEST_ID
+                            or _PD_STAGE_TRACE_REQUEST_ID in request_ids
+                        )
+                    )
+                    process_started_ns = (
+                        time.perf_counter_ns() if trace_output else 0
+                    )
+                    core_to_frontend_ms = (
+                        (time.monotonic() - outputs.timestamp) * 1000
+                        if trace_output and outputs.timestamp
+                        else 0.0
+                    )
 
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None
@@ -690,6 +728,18 @@ class AsyncLLM(EngineClient):
                             await engine_core.abort_requests_async(
                                 processed_outputs.reqs_to_abort
                             )
+
+                    if trace_output:
+                        process_done_ns = time.perf_counter_ns()
+                        logger.info(
+                            "[PD_STAGE_TRACE] scope=frontend_output step=%d "
+                            "requests=%s core_to_frontend_ms=%.3f "
+                            "process_and_stream_put_ms=%.3f",
+                            frontend_step,
+                            ";".join(request_ids[:8]),
+                            core_to_frontend_ms,
+                            (process_done_ns - process_started_ns) / 1_000_000,
+                        )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
 
