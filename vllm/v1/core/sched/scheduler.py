@@ -1106,6 +1106,34 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
+        capture_final_hidden_req_ids: set[str] = set()
+        for req_id, num_tokens in num_scheduled_tokens.items():
+            request = self.requests[req_id]
+            if not request.capture_final_hidden:
+                continue
+            computed_before = request.num_computed_tokens
+            computed_after = computed_before + num_tokens
+            crosses_prompt_end = (
+                computed_before < request.num_prompt_tokens <= computed_after
+            )
+            logger.info(
+                "[FINAL_HIDDEN_SCHED_DECISION] req=%s computed_before=%d "
+                "scheduled_tokens=%d computed_after=%d prompt_tokens=%d "
+                "request_tokens=%d is_prefill_chunk=%s crosses_prompt_end=%s "
+                "capture=%s",
+                req_id,
+                computed_before,
+                num_tokens,
+                computed_after,
+                request.num_prompt_tokens,
+                request.num_tokens,
+                request.is_prefill_chunk,
+                crosses_prompt_end,
+                crosses_prompt_end,
+            )
+            if crosses_prompt_end:
+                capture_final_hidden_req_ids.add(req_id)
+
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1122,13 +1150,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
-            capture_final_hidden_req_ids={
-                req_id
-                for req_id, num_tokens in num_scheduled_tokens.items()
-                if (req := self.requests[req_id]).capture_final_hidden
-                and req.num_computed_tokens < req.num_prompt_tokens
-                <= req.num_computed_tokens + num_tokens
-            },
+            capture_final_hidden_req_ids=capture_final_hidden_req_ids,
             bootstrap_sample_req_ids=bootstrap_sample_req_ids,
             bootstrap_final_hiddens={
                 req_id: self.requests[req_id].bootstrap_final_hidden
