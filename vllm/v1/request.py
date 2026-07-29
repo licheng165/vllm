@@ -73,6 +73,16 @@ class Request:
         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
         resumable: bool = False,
         reasoning_ended: bool | None = None,
+        # DSA offload correlation fields (§5.3/§5.4). Defaults keep existing
+        # callers working; the Scheduler stamps scope_id/request_process_instance
+        # at admission, and the Router supplies trace_id/transfer_id/dispatch_epoch
+        # via kv_transfer_params for P/D.
+        trace_id: str | None = None,
+        scope_id: int = 0,
+        request_process_instance: str | None = None,
+        transfer_id: str | None = None,
+        dispatch_epoch: int = 0,
+        route_epoch: int = 0,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -94,6 +104,16 @@ class Request:
         # P/D: Connector-specific KV transfer parameters.
         self.kv_transfer_params: dict[str, Any] | None = None
 
+        # DSA offload correlation (populated below / by the Scheduler at admit).
+        self.trace_id = trace_id
+        self.scope_id = scope_id
+        # Default the RequestKey incarnation to this process's instance until the
+        # Scheduler stamps it; the Scheduler incarnation is authoritative.
+        self.request_process_instance = request_process_instance
+        self.transfer_id = transfer_id
+        self.dispatch_epoch = dispatch_epoch
+        self.route_epoch = route_epoch
+
         if pooling_params is not None:
             # Pooling models.
             self.max_tokens = 1
@@ -110,6 +130,19 @@ class Request:
                 )
         else:
             raise ValueError("sampling_params and pooling_params can't both be unset")
+
+        # If the Router supplied P/D correlation ids via kv_transfer_params, hoist
+        # them onto the request so they propagate with the RequestKey (§5.3). Do
+        # not overwrite an explicit constructor argument.
+        if self.kv_transfer_params:
+            if self.trace_id is None and isinstance(
+                    self.kv_transfer_params.get("trace_id"), str):
+                self.trace_id = self.kv_transfer_params["trace_id"]
+            if self.transfer_id is None and isinstance(
+                    self.kv_transfer_params.get("transfer_id"), str):
+                self.transfer_id = self.kv_transfer_params["transfer_id"]
+            if isinstance(self.kv_transfer_params.get("dispatch_epoch"), int):
+                self.dispatch_epoch = self.kv_transfer_params["dispatch_epoch"]
 
         self.prompt_token_ids = prompt_token_ids
         self.prompt_embeds = prompt_embeds
@@ -198,7 +231,37 @@ class Request:
             block_hasher=block_hasher,
             resumable=request.resumable,
             reasoning_ended=request.reasoning_ended,
+            trace_id=getattr(request, "trace_id", None),
+            transfer_id=getattr(request, "transfer_id", None),
+            dispatch_epoch=getattr(request, "dispatch_epoch", 0),
         )
+
+    # -- DSA offload correlation helpers (§5.3/§5.4) ------------------------
+    def dsa_request_key(self):
+        """Return the process-incarnation-aware :class:`RequestKey`.
+
+        Lazily imports the dataclass to avoid an import cycle with the
+        observability package at module load.
+        """
+        from vllm.observability.dsa_offload import RequestKey
+        return RequestKey(
+            self.request_process_instance or "",
+            self.request_id,
+            self.scope_id,
+        )
+
+    def dsa_correlation_fields(self) -> dict[str, Any]:
+        """Cheap (no tensor) correlation fields for structured log events."""
+        fields: dict[str, Any] = {
+            "trace_id": self.trace_id,
+            "request_process_instance": self.request_process_instance,
+            "scope_id": self.scope_id,
+            "route_epoch": self.route_epoch or None,
+        }
+        if self.transfer_id is not None:
+            fields["transfer_id"] = self.transfer_id
+            fields["dispatch_epoch"] = self.dispatch_epoch or None
+        return fields
 
     def append_output_token_ids(
         self,

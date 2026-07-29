@@ -42,6 +42,16 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # DSA offload correlation (§5.3). Carried so the worker / LMCache ReqMeta
+    # can attach the same RequestKey/trace to its events. Defaults keep this
+    # backward compatible with callers that construct NewRequestData directly.
+    trace_id: str | None = None
+    scope_id: int = 0
+    request_process_instance: str | None = None
+    transfer_id: str | None = None
+    dispatch_epoch: int = 0
+    route_epoch: int = 0
+
     @classmethod
     def from_request(
         cls,
@@ -60,6 +70,12 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            trace_id=request.trace_id,
+            scope_id=request.scope_id,
+            request_process_instance=request.request_process_instance,
+            transfer_id=request.transfer_id,
+            dispatch_epoch=request.dispatch_epoch,
+            route_epoch=request.route_epoch,
         )
 
     def __repr__(self) -> str:
@@ -237,6 +253,11 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # Monotonic per-engine scheduling step id (DSA offload correlation §5.3).
+    # Lets worker-side events reference the exact schedule step they belong to.
+    # Default 0 preserves backward compatibility for callers that do not set it.
+    schedule_id: int = 0
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

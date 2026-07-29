@@ -40,12 +40,45 @@ def _decode_window_save_window_size() -> int:
         return 0
 
 
+def _mtp_dw_diag_enabled() -> bool:
+    # Legacy [MTP_DW] emitters are disabled once the unified dsa_offload.v1
+    # protocol is active (see §4 of the DSA log enhancement design).
+    from vllm.observability.dsa_offload import DiagLevel, get_dsa_diag_level
+    if get_dsa_diag_level() != DiagLevel.OFF:
+        return False
+    return os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
+
+
 def _mtp_dw_event(stage: str, **fields: object) -> None:
-    if os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0") != "1":
+    if not _mtp_dw_diag_enabled():
         return
     payload = {"schema": 1, "stage": stage, "owner": "vllm_kv_manager"}
     payload.update(fields)
     logger.info("[MTP_DW] %s", json.dumps(payload, separators=(",", ":")))
+
+
+# Structured dsa_offload.v1 emitter for the KV manager (§7.2). No-op until the
+# unified level is set; legacy [MTP_DW] emitters above are disabled in that case.
+from vllm.observability.dsa_offload import (
+    DiagLevel as _DSADiagLevel,
+    QUORUM_UNPROVEN_MAX_MERGE as _QUORUM_UNPROVEN,
+    dsa_logger_for as _dsa_logger_for,
+)
+
+_dsa_log = _dsa_logger_for("vllm.kv_manager")
+
+
+def _dsa_corr_prefix(corr: dict | None) -> dict:
+    """Pull the cheap request-correlation fields out of a Scheduler-supplied
+    correlation dict (trace_id/request_process_instance/scope_id)."""
+    if not corr:
+        return {}
+    out: dict = {}
+    for k in ("trace_id", "request_process_instance", "scope_id"):
+        v = corr.get(k)
+        if v is not None:
+            out[k] = v
+    return out
 
 
 class SingleTypeKVCacheManager(ABC):
@@ -524,6 +557,7 @@ class DSALatentManager(FullAttentionManager):
         self,
         request_id: str,
         committed_end: int,
+        correlation: dict | None = None,
     ) -> int:
         if committed_end <= 0:
             return 0
@@ -540,6 +574,7 @@ class DSALatentManager(FullAttentionManager):
         end = min(committed_end // self.block_size, len(blocks))
         window_size = _decode_window_save_window_size()
         window_start = max(0, committed_end - window_size) if window_size else None
+        resident_tail_start = window_start if window_start is not None else 0
         if end <= start:
             _mtp_dw_event(
                 "release",
@@ -580,6 +615,37 @@ class DSALatentManager(FullAttentionManager):
             release_gate="enabled",
             freed_blocks=len(removed_blocks),
         )
+        # Canonical latent release event (§7.2): this manager is the unique owner
+        # of the atomic latent-block free. Correlation (trace_id/scope_id/
+        # route_epoch/source_generation_id/receipt_bundle_id) is supplied by the
+        # Scheduler from the consumed frontier bundle; until the exact-set
+        # aggregation is wired end-to-end the release is observed-only, so the
+        # quorum_status honestly reflects that.
+        if _dsa_log.enabled(_DSADiagLevel.LIFECYCLE):
+            corr = correlation or {}
+            _dsa_log.emit(
+                "latent.release.commit",
+                outcome="ok",
+                level=_DSADiagLevel.LIFECYCLE,
+                req_id=request_id,
+                release_end=committed_end,
+                completed_canonical_end=corr.get("completed_canonical_end",
+                                                 committed_end),
+                sparse_source_end=corr.get("sparse_source_end"),
+                resident_tail_start=resident_tail_start,
+                remap_end=corr.get("remap_end"),
+                initial_prefill_complete=corr.get("initial_prefill_complete",
+                                                  True),
+                scratch_blocks=self.scratch_blocks,
+                release_start_block=start,
+                release_end_block=end,
+                invalidated_logical_blocks=len(removed_blocks),
+                route_epoch=corr.get("route_epoch"),
+                source_generation_id=corr.get("source_generation_id"),
+                receipt_bundle_id=corr.get("receipt_bundle_id"),
+                quorum_status=_QUORUM_UNPROVEN,
+                **_dsa_corr_prefix(corr),
+            )
         if end * self.block_size > committed_end or start < self.scratch_blocks:
             _mtp_dw_event(
                 "fail",
@@ -593,6 +659,17 @@ class DSALatentManager(FullAttentionManager):
                 block_size=self.block_size,
                 scratch_blocks=self.scratch_blocks,
             )
+            if _dsa_log.enabled(_DSADiagLevel.LIFECYCLE):
+                _dsa_log.emit(
+                    "invariant.violation",
+                    outcome="error",
+                    level=_DSADiagLevel.LIFECYCLE,
+                    req_id=request_id,
+                    reason="release_range_invariant",
+                    release_end=committed_end,
+                    release_start_block=start,
+                    release_end_block=end,
+                )
         if removed_blocks:
             logger.info(
                 "[DECODE_WINDOW_RELEASE] req=%s committed_end=%d "

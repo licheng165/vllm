@@ -71,7 +71,30 @@ logger = init_logger(__name__)
 
 
 def _mtp_dw_diag_enabled() -> bool:
+    # The legacy [MTP_DW] emitters are atomically disabled once the unified
+    # dsa_offload.v1 protocol is active, to avoid duplicate/double-emitting the
+    # same lifecycle (see §4 of the DSA log enhancement design).
+    if get_dsa_diag_level() != DiagLevel.OFF:
+        return False
     return os.getenv("VLLM_ASCEND_MTP_DW_DIAG", "0") == "1"
+
+
+# Structured dsa_offload.v1 emitter for the Scheduler (§5.3/§6.2). A no-op until
+# VLLM_ASCEND_DSA_DIAG_LEVEL is set; process_instance is shared with all worker
+# views in this process.
+from vllm.observability.dsa_offload import (
+    DiagLevel,
+    dsa_logger_for as _dsa_logger_for,
+    get_dsa_diag_level,
+)
+from vllm.observability.dsa_offload import _get_state as _get_dsa_state
+
+_dsa_log = _dsa_logger_for("vllm.scheduler")
+
+
+def get_dsa_process_instance() -> str:
+    """Return the process-wide incarnation id used for RequestKey identity."""
+    return _get_dsa_state().process_instance
 
 
 def _mtp_dw_deep_diag_enabled() -> bool:
@@ -262,6 +285,12 @@ class Scheduler(SchedulerInterface):
 
         # req_id -> Request
         self.requests: dict[str, Request] = {}
+        # DSA offload correlation state (§5.4): the Scheduler incarnation that
+        # owns RequestKey identity, a per-incarnation scope counter, and the
+        # monotonic schedule step id threaded into every SchedulerOutput.
+        self._dsa_process_instance = get_dsa_process_instance()
+        self._dsa_scope_seq = 0
+        self._dsa_schedule_id = 0
         # Scheduling policy
         try:
             self.policy = SchedulingPolicy(self.scheduler_config.policy)
@@ -1001,6 +1030,7 @@ class Scheduler(SchedulerInterface):
             else None
         )
 
+        self._dsa_schedule_id += 1
         scheduler_output = SchedulerOutput(
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
@@ -1017,6 +1047,7 @@ class Scheduler(SchedulerInterface):
             finished_req_ids=self.finished_req_ids,
             free_encoder_mm_hashes=self.encoder_cache_manager.get_freed_mm_hashes(),
             new_block_ids_to_zero=new_block_ids_to_zero,
+            schedule_id=self._dsa_schedule_id,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1932,10 +1963,28 @@ class Scheduler(SchedulerInterface):
         else:
             if request.resumable:
                 request.streaming_queue = deque()
+            # Stamp the process-incarnation-aware scope (§5.4) so events for this
+            # request can be correlated and stale events from a prior incarnation
+            # are rejected. scope_id is unique within this Scheduler incarnation.
+            if request.request_process_instance is None:
+                request.request_process_instance = self._dsa_process_instance
+            if not request.scope_id:
+                self._dsa_scope_seq += 1
+                request.scope_id = self._dsa_scope_seq
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            if _dsa_log.enabled(DiagLevel.LIFECYCLE):
+                _dsa_log.emit(
+                    "request.admit",
+                    outcome="ok",
+                    level=DiagLevel.LIFECYCLE,
+                    prompt_tokens=getattr(request, "num_prompt_tokens", None),
+                    max_tokens=getattr(request, "max_tokens", None),
+                    mode="resident",
+                    **request.dsa_correlation_fields(),
+                )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus

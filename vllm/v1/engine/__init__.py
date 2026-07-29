@@ -101,6 +101,14 @@ class EngineCoreRequest(
 
     reasoning_ended: bool | None = None
 
+    # DSA offload P/D correlation (§5.3). The Router stamps these into the
+    # request so producer and decoder share the same non-sensitive trace id and
+    # the global transfer id. ``omit_defaults=True`` keeps them off the wire when
+    # unset, so this is wire-compatible with older frontends.
+    trace_id: str | None = None
+    transfer_id: str | None = None
+    dispatch_epoch: int = 0
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
