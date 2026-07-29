@@ -159,6 +159,15 @@ class KVConnectorOutput:
     # It captures a static setup info and should almost always remain constant
     # for a given connector after discovery. Default value entails no change.
     expected_finished_count: int = 0
+    # DSA individual worker receipts.  Individual workers only emit receipts;
+    # the executor aggregates into bundles by exact-set quorum (design 8.3).
+    # Typed as object to avoid importing dsa_types here (avoids a cycle); the
+    # concrete type is vllm.v1.core.sched.dsa_types.DSAOperationReceipt.
+    dsa_receipts: tuple[object, ...] = ()
+    # DSA executor-aggregated receipt bundles.
+    dsa_bundles: tuple[object, ...] = ()
+    # DSA control events emitted to the Scheduler.
+    dsa_events: tuple[object, ...] = ()
 
     def is_empty(self):
         return (

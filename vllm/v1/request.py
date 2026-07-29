@@ -6,7 +6,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -26,6 +26,7 @@ from vllm.v1.utils import ConstantList
 if TYPE_CHECKING:
     from vllm.lora.request import LoRARequest
     from vllm.v1.core.kv_cache_utils import BlockHash
+    from vllm.v1.core.sched.dsa_types import DSARequestState
 
 
 @dataclass
@@ -175,6 +176,15 @@ class Request:
         self.resumable = resumable
         # None entry in the queue means finished.
         self.streaming_queue: deque[StreamingUpdate | None] | None = None
+
+        # DSA request-level threshold routing state (lazily initialized by the
+        # Scheduler via initialize_dsa_state).  None when threshold routing is
+        # not in use for this request yet.  See vllm.v1.core.sched.dsa_types.
+        self.dsa_state: Optional["DSARequestState"] = None
+        # DSA waiting sub-reason string (one of dsa_types.DSA_WAITING_STATES).
+        # Mutually exclusive with normal scheduling; a non-None value keeps the
+        # request out of the model forward until the waiting condition clears.
+        self.dsa_waiting_reason: Optional[str] = None
 
     @classmethod
     def from_engine_core_request(

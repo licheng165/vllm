@@ -53,6 +53,7 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
+from vllm.v1.core.sched.dsa_controller import DSAController, DSAControllerConfig
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -344,6 +345,16 @@ class Scheduler(SchedulerInterface):
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
 
+        # DSA request-level threshold routing controller.  The normalized
+        # configuration is written into ``additional_config`` by the Ascend
+        # platform config validation (see vllm_ascend.platform).  When the
+        # threshold is absent or 0 the controller is disabled; requests still
+        # carry a RequestKey / DSARequestState (LEGACY route) so the operation
+        # registry / quorum / failure-cleanup safety machinery is active.
+        self.dsa_controller = DSAController(
+            config=self._build_dsa_controller_config()
+        )
+
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
         self.need_mamba_block_aligned_split = (
@@ -441,6 +452,50 @@ class Scheduler(SchedulerInterface):
                 # prefill the last few tokens
                 pass
         return num_new_tokens
+
+    def _build_dsa_controller_config(self) -> DSAControllerConfig:
+        """Build the DSA controller config from ``additional_config``.
+
+        The Ascend platform config validation parses the
+        ``VLLM_ASCEND_DSA_CONTEXT_LENGTH_THRESHOLD`` env var and writes the
+        normalized config (threshold + frontier parameters) into
+        ``vllm_config.additional_config["dsa"]``.  When absent, the controller
+        is built disabled (threshold=0, LEGACY route).
+        """
+        additional = (
+            self.vllm_config.additional_config
+            if self.vllm_config.additional_config is not None
+            else {}
+        )
+        dsa_cfg = additional.get("dsa") or {}
+        if not isinstance(dsa_cfg, dict) or not dsa_cfg.get("threshold"):
+            return DSAControllerConfig.disabled(
+                block_size=self.block_size,
+                chunk_size=int(dsa_cfg.get("chunk_size", 0)) if isinstance(
+                    dsa_cfg, dict
+                ) else 0,
+                node_role=str(dsa_cfg.get("node_role", "standalone"))
+                if isinstance(dsa_cfg, dict)
+                else "standalone",
+            )
+        return DSAControllerConfig(
+            threshold=int(dsa_cfg["threshold"]),
+            max_model_len=int(dsa_cfg.get("max_model_len", self.max_model_len)),
+            block_size=int(dsa_cfg.get("block_size", self.block_size)),
+            chunk_size=int(dsa_cfg["chunk_size"]),
+            window_size=int(dsa_cfg.get("window_size", 0)),
+            index_topk=int(dsa_cfg.get("index_topk", 0)),
+            query_width=int(dsa_cfg.get("query_width", 1)),
+            scratch_capacity=int(dsa_cfg["scratch_capacity"]),
+            node_role=str(dsa_cfg.get("node_role", "standalone")),
+            deployment_mode=str(dsa_cfg.get("deployment_mode", "standalone")),
+            data_compatibility_fingerprint=str(
+                dsa_cfg.get("data_compatibility_fingerprint", "")
+            ),
+            instance_capability_digest=str(
+                dsa_cfg.get("instance_capability_digest", "")
+            ),
+        )
 
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
@@ -1019,6 +1074,37 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
 
+        # Attach DSA route snapshots so workers/connectors consume the
+        # authoritative route decision and do NOT re-derive sparse mode from
+        # prompt_len (design section 8.2 / 10.1).  Only populated when the
+        # threshold state machine is enabled; LEGACY requests still carry a
+        # snapshot so safety machinery is consistent.
+        if self.dsa_controller.config.enabled or any(
+            getattr(r, "dsa_state", None) is not None
+            for r in scheduled_new_reqs
+        ):
+            scheduled_ids = list(num_scheduled_tokens.keys())
+            accepted_ends = {
+                rid: self.requests[rid].num_tokens
+                for rid in scheduled_ids
+                if rid in self.requests
+            }
+            snapshots = self.dsa_controller.build_route_snapshots(
+                scheduled_ids, accepted_ends
+            )
+            if snapshots:
+                scheduler_output.dsa_routes = {
+                    rid: snap for rid, snap in snapshots.items()
+                }
+                scheduler_output.dsa_data_compatibility_fingerprint = (
+                    self.dsa_controller.config.data_compatibility_fingerprint
+                    or None
+                )
+                scheduler_output.dsa_instance_capability_digest = (
+                    self.dsa_controller.config.instance_capability_digest
+                    or None
+                )
+
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store
         # 2. Wrap up all the KV cache load / save ops into an opaque object
@@ -1055,6 +1141,11 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        # Begin a typed DSA preemption quiesce before freeing blocks.  The
+        # first version uses vLLM's full-recompute preemption semantics, so we
+        # retire the old RequestKey; the request gets a fresh key when it is
+        # re-admitted (design section 15.4).
+        self.dsa_controller.begin_preemption(request.request_id)
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -1936,6 +2027,15 @@ class Scheduler(SchedulerInterface):
             self.requests[request.request_id] = request
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+            # Initialize DSA request-level threshold routing state.  Even when
+            # the threshold is disabled (LEGACY route) we attach a
+            # RequestKey/DSARequestState so the operation registry / quorum /
+            # failure-cleanup safety machinery is active (design section 8.3).
+            dsa_state = self.dsa_controller.initialize_state(
+                request.request_id, request.num_tokens
+            )
+            request.dsa_state = dsa_state
+            self.dsa_controller.attach_state(dsa_state)
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2079,6 +2179,9 @@ class Scheduler(SchedulerInterface):
             self._free_blocks(request)
 
         _mtp_dw_cleanup_request(self, request_id)
+        # Retire the DSA request state so late events/completions for the old
+        # RequestKey are rejected as stale (design section 6.3 / 8.3).
+        self.dsa_controller.finish_request(request_id)
 
         return kv_xfer_params
 

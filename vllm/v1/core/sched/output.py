@@ -42,6 +42,12 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # DSA process-incarnation-aware request key (string form of
+    # RequestKey).  Carried so workers/connectors can match the authoritative
+    # lifecycle identity and reject stale finish/preemption of a reused id.
+    # None when DSA threshold routing is disabled.
+    dsa_request_key: str | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -49,6 +55,10 @@ class NewRequestData:
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
     ) -> "NewRequestData":
+        dsa_state = getattr(request, "dsa_state", None)
+        dsa_request_key: str | None = None
+        if dsa_state is not None:
+            dsa_request_key = str(dsa_state.request_key)
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -60,6 +70,7 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            dsa_request_key=dsa_request_key,
         )
 
     def __repr__(self) -> str:
@@ -122,6 +133,9 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    # DSA request key strings (req_id -> str(RequestKey)) for the cached
+    # requests in this step.  Empty when DSA threshold routing is disabled.
+    dsa_request_keys: dict[str, str] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -237,6 +251,27 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # DSA per-request route snapshots keyed by request_id (string form of the
+    # authoritative RequestKey.request_id).  Workers/connectors consume these
+    # immutable snapshots and MUST NOT re-derive sparse mode from prompt_len.
+    # See vllm.v1.core.sched.dsa_types.DSARouteSnapshot.  Empty when threshold
+    # routing is disabled (threshold == 0).
+    dsa_routes: dict[str, object] | None = None
+
+    # DSA capability fingerprints.  ``data_compatibility_fingerprint`` must be
+    # identical across all PD participants; ``instance_capability_digest`` only
+    # identifies this instance.  None when threshold routing is disabled.
+    dsa_data_compatibility_fingerprint: str | None = None
+    dsa_instance_capability_digest: str | None = None
+
+    # DSA typed connector-only import commands (PD Decode dense bootstrap).
+    # None / empty when no connector-only import is scheduled this step.
+    dsa_connector_only_imports: tuple[object, ...] | None = None
+
+    # DSA typed preemption actions replacing bare request-id preemption.
+    # None / empty when no DSA preemption quiesce is scheduled this step.
+    dsa_preemption_actions: tuple[object, ...] | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
