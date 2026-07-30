@@ -1686,6 +1686,13 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
+            # Communicate which requests had their KV load invalidated this
+            # step (from invalid_block_ids) so the owning connector can fail
+            # their DSA operation generations before permit arbitration. This
+            # must precede the arbitration call below.
+            kv_connector_output.dsa_invalidated_req_ids = (
+                set(failed_kv_load_req_ids) if failed_kv_load_req_ids else set()
+            )
             self._update_from_kv_xfer_finished(kv_connector_output)
 
         # collect KV cache events from KV cache manager
@@ -2391,11 +2398,54 @@ class Scheduler(SchedulerInterface):
         """
 
         if self.connector is not None:
-            self.connector.update_connector_output(kv_connector_output)
+            # The owning connector arbitrates raw ``dsa_commit_evidence`` into
+            # validated ``DSAReleasePermit``s (honouring kind/generation and the
+            # required rank quorum, and the invalidated req ids populated above).
+            # Only permits may free latent blocks; raw evidence never releases.
+            validated_permits = self.connector.update_connector_output(
+                kv_connector_output
+            )
+        else:
+            validated_permits = {}
+        kv_connector_output.dsa_release_permits = validated_permits
+
+        # Consume validated permits first. These carry kind/generation for
+        # observability and override the legacy scalar frontier for the same
+        # request (typed path is authoritative during the migration).
+        for req_id, permit in validated_permits.items():
+            request = self.requests.get(req_id)
+            if request is None:
+                logger.debug(
+                    "[DSA_RELEASE] skip permit for unknown request %s "
+                    "kind=%s frontier=%d generation=%d",
+                    req_id,
+                    permit.kind,
+                    permit.frontier,
+                    permit.generation,
+                )
+                continue
+            removed_blocks = self.kv_cache_manager.remove_saved_decode_window_blocks(
+                req_id,
+                permit.frontier,
+            )
+            logger.debug(
+                "[DSA_RELEASE] permit req=%s kind=%s frontier=%d generation=%d "
+                "freed_blocks=%d",
+                req_id,
+                permit.kind,
+                permit.frontier,
+                permit.generation,
+                removed_blocks,
+            )
 
         for req_id, committed_end in (
             kv_connector_output.completed_decode_window_saves.items()
         ):
+            # Requests already released via a validated permit skip the legacy
+            # scalar path to avoid double-freeing (DSALatentManager guards with
+            # null_block replacement anyway, but we avoid redundant work/logs).
+            if req_id in validated_permits:
+                continue
             request = self.requests.get(req_id)
             if request is None:
                 if _mtp_dw_sample_deep_completion(self, req_id, committed_end):

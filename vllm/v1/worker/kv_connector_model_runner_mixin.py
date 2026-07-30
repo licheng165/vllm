@@ -7,7 +7,7 @@ Define KV connector functionality mixin for model runners.
 import copy
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -25,6 +25,7 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    DSACommitEvidence,
     KVConnectorOutput,
     ModelRunnerOutput,
 )
@@ -34,6 +35,18 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
+
+
+class FinalizeKVResult(NamedTuple):
+    """Result of :meth:`finalize_kv_connector`.
+
+    ``completed_decode_window_saves`` is the legacy scalar frontier map; the
+    typed ``dsa_commit_evidence`` list carries per-reporter DSA evidence that
+    must be arbitrated into permits before any latent release.
+    """
+
+    completed_decode_window_saves: dict[str, int] = {}
+    dsa_commit_evidence: list[DSACommitEvidence] = []
 
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
@@ -78,7 +91,7 @@ class KVConnectorModelRunnerMixin:
         )
 
     @staticmethod
-    def finalize_kv_connector() -> dict[str, int]:
+    def finalize_kv_connector() -> "FinalizeKVResult":
         """Finalize the KV connector: wait_for_save and clear metadata.
 
         Call after draft model forward when defer_finalize=True was used.
@@ -90,14 +103,26 @@ class KVConnectorModelRunnerMixin:
                 get_completed_decode_window_saves = getattr(
                     kv_connector, "get_completed_decode_window_saves", None
                 )
-                return (
+                completed = (
                     get_completed_decode_window_saves()
                     if get_completed_decode_window_saves is not None
                     else {}
                 )
+                get_dsa_commit_evidence = getattr(
+                    kv_connector, "get_dsa_commit_evidence", None
+                )
+                evidence = (
+                    list(get_dsa_commit_evidence())
+                    if get_dsa_commit_evidence is not None
+                    else []
+                )
+                return FinalizeKVResult(
+                    completed_decode_window_saves=completed,
+                    dsa_commit_evidence=evidence,
+                )
             finally:
                 kv_connector.clear_connector_metadata()
-        return {}
+        return FinalizeKVResult()
 
     # This context manager must be used within an active forward context.
     # It encapsulates the entire KV connector lifecycle within execute_model
@@ -140,6 +165,11 @@ class KVConnectorModelRunnerMixin:
                     output.completed_decode_window_saves = (
                         get_completed_decode_window_saves()
                     )
+                get_dsa_commit_evidence = getattr(
+                    kv_connector, "get_dsa_commit_evidence", None
+                )
+                if get_dsa_commit_evidence is not None:
+                    output.dsa_commit_evidence = list(get_dsa_commit_evidence())
 
                 output.kv_connector_stats = kv_connector.get_kv_connector_stats()
                 output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()

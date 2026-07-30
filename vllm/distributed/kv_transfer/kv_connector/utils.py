@@ -17,7 +17,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
+from vllm.v1.outputs import DSACommitEvidence, KVConnectorOutput, ModelRunnerOutput
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
@@ -91,6 +91,12 @@ class KVOutputAggregator:
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
         completed_decode_window_saves: dict[str, int] = {}
+        # DSA typed evidences: collect every reporter record, deduplicating
+        # identical records. We must NOT reduce by max(frontier) here, otherwise
+        # an early/stale rank could let the scheduler release a new block table
+        # before the owning connector arbitrates kind/generation/rank quorum.
+        seen_evidence: set[DSACommitEvidence] = set()
+        dsa_commit_evidence: list[DSACommitEvidence] = []
         for model_runner_output in outputs:
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
@@ -162,6 +168,14 @@ class KVOutputAggregator:
                     window_end,
                 )
 
+            # Preserve every DSA evidence reporter (deduplicating identical
+            # records); see comment above on why max(frontier) is forbidden.
+            for evidence in kv_output.dsa_commit_evidence:
+                if evidence in seen_evidence:
+                    continue
+                seen_evidence.add(evidence)
+                dsa_commit_evidence.append(evidence)
+
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
 
@@ -174,6 +188,7 @@ class KVOutputAggregator:
             kv_connector_worker_meta=aggregated_kv_connector_worker_meta or None,
             invalid_block_ids=invalid_block_ids,
             completed_decode_window_saves=completed_decode_window_saves,
+            dsa_commit_evidence=dsa_commit_evidence,
             expected_finished_count=self._expected_finished_count,
         )
 

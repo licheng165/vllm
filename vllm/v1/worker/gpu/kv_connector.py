@@ -99,6 +99,11 @@ class ActiveKVConnector(KVConnector):
             output.completed_decode_window_saves = (
                 get_completed_decode_window_saves()
             )
+        get_dsa_commit_evidence = getattr(
+            self.kv_connector, "get_dsa_commit_evidence", None
+        )
+        if get_dsa_commit_evidence is not None:
+            output.dsa_commit_evidence = list(get_dsa_commit_evidence())
         output.kv_connector_stats = self.kv_connector.get_kv_connector_stats()
         output.kv_cache_events = self.kv_connector.get_kv_connector_kv_cache_events()
         if clear_metadata:

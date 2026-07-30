@@ -28,7 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.outputs import DSACommitEvidence, DSAReleasePermit, KVConnectorOutput
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
@@ -320,6 +320,38 @@ class MultiConnector(KVConnectorBase_V1):
                 completed[req_id] = max(completed.get(req_id, 0), window_end)
         return completed
 
+    def get_dsa_commit_evidence(self) -> list[DSACommitEvidence]:
+        """Aggregate typed DSA evidences from all sub-connectors.
+
+        Identical reporter records are deduplicated. We deliberately do NOT
+        reduce by ``max(frontier)``: doing so would let an early or stale rank
+        release a new block table before the scheduler-side owner arbitrates.
+        """
+        seen: set[DSACommitEvidence] = set()
+        evidence: list[DSACommitEvidence] = []
+        for c in self._connectors:
+            get_evidence = getattr(c, "get_dsa_commit_evidence", None)
+            if get_evidence is None:
+                continue
+            for ev in get_evidence():
+                if ev in seen:
+                    continue
+                seen.add(ev)
+                evidence.append(ev)
+        return evidence
+
+    def get_dsa_release_owner(self):
+        """Return the unique scheduler-side connector that owns DSA release
+        arbitration, or ``None`` if no sub-connector declares the capability.
+
+        The owner is the first sub-connector exposing ``arbitrate_dsa_release``.
+        Only the owner may emit permits; other connectors must not.
+        """
+        for c in self._connectors:
+            if getattr(c, "arbitrate_dsa_release", None) is not None:
+                return c
+        return None
+
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Set xPU-specific copy ops for all sub-connectors."""
         for c in self._connectors:
@@ -403,7 +435,9 @@ class MultiConnector(KVConnectorBase_V1):
             self._extra_async_saves = {}
         return metadata
 
-    def update_connector_output(self, connector_output: KVConnectorOutput):
+    def update_connector_output(
+        self, connector_output: KVConnectorOutput
+    ) -> dict[str, DSAReleasePermit]:
         multi_connector_worker_meta: MultiKVConnectorWorkerMetadata | None = None
         if connector_output.kv_connector_worker_meta is not None:
             assert isinstance(
@@ -412,6 +446,8 @@ class MultiConnector(KVConnectorBase_V1):
             )
             multi_connector_worker_meta = connector_output.kv_connector_worker_meta
 
+        owner = self.get_dsa_release_owner()
+        permits: dict[str, DSAReleasePermit] = {}
         try:
             for i, c in enumerate(self._connectors):
                 if multi_connector_worker_meta is not None:
@@ -419,10 +455,35 @@ class MultiConnector(KVConnectorBase_V1):
                     connector_output.kv_connector_worker_meta = (
                         multi_connector_worker_meta.metadata[i]
                     )
-                c.update_connector_output(connector_output)
+                sub_permits = c.update_connector_output(connector_output)
+                if not sub_permits:
+                    continue
+                # Only a designated owner may produce release permits. With no
+                # owner designated, no connector is authorized to arbitrate DSA
+                # evidence, so any emitted permit is a misconfiguration and must
+                # never silently free blocks.
+                if owner is None:
+                    raise RuntimeError(
+                        "Sub-connector produced DSA release permits but no DSA "
+                        f"release owner is designated; offender={c}"
+                    )
+                if c is not owner:
+                    raise RuntimeError(
+                        "Non-owner sub-connector produced DSA release permits; "
+                        f"owner={owner}, offender={c}"
+                    )
+                for req_id, permit in sub_permits.items():
+                    existing = permits.get(req_id)
+                    if existing is not None and existing != permit:
+                        raise RuntimeError(
+                            f"Conflicting DSA permits for req={req_id}: "
+                            f"{existing} vs {permit}"
+                        )
+                    permits[req_id] = permit
         finally:
             # restore kv_connector_worker_meta
             connector_output.kv_connector_worker_meta = multi_connector_worker_meta
+        return permits
 
     def get_handshake_metadata(self) -> KVConnectorHandshakeMetadata | None:
         """

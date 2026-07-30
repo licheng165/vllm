@@ -4044,11 +4044,16 @@ class GPUModelRunner(
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
         if spec_config is not None:
-            completed_decode_window_saves = self.finalize_kv_connector()
-            if completed_decode_window_saves:
+            finalize_result = self.finalize_kv_connector()
+            if (
+                finalize_result.completed_decode_window_saves
+                or finalize_result.dsa_commit_evidence
+            ):
                 if self.kv_connector_output is None:
                     self.kv_connector_output = KVConnectorOutput()
-                for req_id, window_end in completed_decode_window_saves.items():
+                for req_id, window_end in (
+                    finalize_result.completed_decode_window_saves.items()
+                ):
                     self.kv_connector_output.completed_decode_window_saves[
                         req_id
                     ] = max(
@@ -4057,6 +4062,12 @@ class GPUModelRunner(
                         ),
                         window_end,
                     )
+                # Typed DSA evidences are appended verbatim (the aggregator
+                # downstream deduplicates and preserves reporters); never use
+                # max(frontier) on typed evidence.
+                self.kv_connector_output.dsa_commit_evidence.extend(
+                    finalize_result.dsa_commit_evidence
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()

@@ -139,6 +139,75 @@ def _combine_non_none(f: Callable[[T, T], T], items: list[T | None]) -> T | None
     return combined
 
 
+# DSA latent offload release kinds. ``*_store`` kinds are produced by worker
+# connectors after a backend fence confirms persistence. ``initial_dense_load``
+# is produced after a cold-start dense prefix load fully succeeds. Only a
+# validated ``DSAReleasePermit`` derived from these evidences may free NPU
+# latent blocks; raw evidences must never release directly.
+DSA_RELEASE_KINDS = (
+    "initial_prefill_store",
+    "initial_dense_load",
+    "promotion_store",
+    "decode_window_store",
+)
+# Store kinds gated by the authoritative storage rank / required store quorum.
+DSA_STORE_KINDS = (
+    "initial_prefill_store",
+    "promotion_store",
+    "decode_window_store",
+)
+
+
+@dataclass(frozen=True)
+class DSACommitEvidence:
+    """Typed, per-reporter evidence that a DSA latent operation succeeded.
+
+    Produced by worker-side connectors only after the relevant backend fence or
+    dense-load coverage check. It is *raw* evidence: the scheduler must never
+    free latent blocks directly from it. The owning connector arbitrates a set
+    of evidences (generation, kind, required ranks) into a validated
+    ``DSAReleasePermit`` before vLLM releases any block.
+    """
+
+    req_id: str
+    kind: str
+    # Exclusive, chunk/block-aligned token end offset that is now persisted.
+    frontier: int
+    # Monotonic operation epoch scoped to (req_id, route generation). Stale or
+    # reused generations must never release a new block table.
+    generation: int
+    # Worker rank that produced this record. Required for store/load quorum
+    # arbitration; aggregation must preserve all reporters (no ``max(frontier)``).
+    reporter_rank: int
+    status: str = "succeeded"
+    error_code: str | None = None
+
+    def __post_init__(self):
+        if self.kind not in DSA_RELEASE_KINDS:
+            raise ValueError(f"Unknown DSA release kind: {self.kind!r}")
+        if self.status not in ("succeeded", "failed"):
+            raise ValueError(f"Unknown DSA evidence status: {self.status!r}")
+        if self.frontier < 0:
+            raise ValueError(f"frontier must be non-negative, got {self.frontier}")
+
+
+@dataclass(frozen=True)
+class DSAReleasePermit:
+    """A validated, arbitration-approved DSA latent release permit.
+
+    Produced by the owning scheduler-side connector after it has checked kind,
+    generation, inflight frontier, alignment, request state and the required
+    rank quorum. vLLM consumes *only* permits (never raw evidence) to call
+    ``remove_saved_decode_window_blocks``.
+    """
+
+    req_id: str
+    kind: str
+    # Exclusive token end offset; ``[scratch, frontier // block_size)`` is freed.
+    frontier: int
+    generation: int
+
+
 @dataclass
 class KVConnectorOutput:
     # [req_ids]
@@ -152,7 +221,25 @@ class KVConnectorOutput:
     invalid_block_ids: set[int] = field(default_factory=set)
     # req_id -> token end offset for decode windows that were saved to the
     # external KV connector and can be evicted from the local latent KV cache.
+    # Legacy scalar path; preserved during the DSA typed-permit migration. New
+    # promotion / PD initial load flows must emit ``dsa_commit_evidence`` and
+    # never write this scalar map.
     completed_decode_window_saves: dict[str, int] = field(default_factory=dict)
+    # Raw, per-reporter DSA commit evidences from worker connectors. These must
+    # NEVER directly trigger a latent release; the owning connector arbitrates
+    # them into ``dsa_release_permits`` (see ``update_connector_output``).
+    # Aggregation across workers/connectors must preserve every reporter record
+    # (deduplicating identical records) and must NOT reduce by ``max(frontier)``.
+    dsa_commit_evidence: list[DSACommitEvidence] = field(default_factory=list)
+    # Validated release permits, populated by the owning scheduler-side
+    # connector inside ``update_connector_output`` after generation/kind/rank
+    # arbitration. vLLM consumes only these to free latent blocks.
+    dsa_release_permits: dict[str, DSAReleasePermit] = field(default_factory=dict)
+    # Requests whose KV load was invalidated by ``invalid_block_ids`` this step,
+    # computed by the scheduler before permit arbitration. The owning connector
+    # uses this to invalidate the corresponding DSA operation generations so a
+    # stale ``initial_dense_load`` evidence cannot release a rebuilt block table.
+    dsa_invalidated_req_ids: set[str] = field(default_factory=set)
     # Configuration describing how many finished sending/receiving
     # notifications should be expected for each request. This allows
     # handshake-based connectors like Nixl to update the KVOutputAggregator.
@@ -168,6 +255,8 @@ class KVConnectorOutput:
             and not self.kv_cache_events
             and not self.invalid_block_ids
             and not self.completed_decode_window_saves
+            and not self.dsa_commit_evidence
+            and not self.dsa_release_permits
             and not self.kv_connector_worker_meta
         )
 
@@ -200,6 +289,35 @@ class KVConnectorOutput:
                     window_end,
                 )
 
+        # DSA typed evidences: preserve every reporter record. Identical
+        # records (same req/kind/frontier/generation/reporter/status) are
+        # deduplicated; conflicting records for the same (req, generation, kind)
+        # are kept as-is so the owning connector can arbitrate (or reject) them.
+        # We explicitly do NOT reduce by max(frontier): doing so would let an
+        # early-reporting rank or a stale generation release a new block table.
+        seen_evidence: set[DSACommitEvidence] = set()
+        dsa_commit_evidence: list[DSACommitEvidence] = []
+        for output in outputs:
+            for evidence in output.dsa_commit_evidence:
+                if evidence in seen_evidence:
+                    continue
+                seen_evidence.add(evidence)
+                dsa_commit_evidence.append(evidence)
+
+        # DSA permits are produced by the owning connector only. Across worker
+        # outputs (which should not carry permits), duplicates are deduplicated;
+        # conflicting permits for the same req are an arbitration bug.
+        dsa_release_permits: dict[str, DSAReleasePermit] = {}
+        for output in outputs:
+            for req_id, permit in output.dsa_release_permits.items():
+                existing = dsa_release_permits.get(req_id)
+                if existing is not None and existing != permit:
+                    raise ValueError(
+                        f"Conflicting DSA release permits for req={req_id}: "
+                        f"{existing} vs {permit}"
+                    )
+                dsa_release_permits[req_id] = permit
+
         assert all(
             output.expected_finished_count == outputs[0].expected_finished_count
             for output in outputs
@@ -213,6 +331,8 @@ class KVConnectorOutput:
             kv_cache_events=kv_cache_events,
             invalid_block_ids=invalid_block_ids,
             completed_decode_window_saves=completed_decode_window_saves,
+            dsa_commit_evidence=dsa_commit_evidence,
+            dsa_release_permits=dsa_release_permits,
             expected_finished_count=expected_finished_count,
         )
 

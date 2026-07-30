@@ -50,7 +50,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.outputs import DSAReleasePermit, KVConnectorOutput
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -517,15 +517,27 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
-    def update_connector_output(self, connector_output: KVConnectorOutput):
+    def update_connector_output(
+        self, connector_output: KVConnectorOutput
+    ) -> "dict[str, DSAReleasePermit]":
         """
         Update KVConnector state from worker-side connectors output.
+
+        For DSA latent offload, the owning connector should also arbitrate the
+        raw ``dsa_commit_evidence`` (honouring kind/generation/required-rank
+        quorum and the scheduler-populated ``dsa_invalidated_req_ids``) into a
+        validated ``DSAReleasePermit`` map and return it. The scheduler frees
+        latent blocks *only* from these permits, never from raw evidence. The
+        default implementation performs no arbitration and releases nothing.
 
         Args:
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
+
+        Returns:
+            A ``req_id -> DSAReleasePermit`` map of validated release permits.
         """
-        return
+        return {}
 
     def request_finished(
         self,
