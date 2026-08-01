@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -25,6 +26,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched import scheduler as scheduler_module
+from vllm.v1.core.sched.dsa_types import DSARouteState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
@@ -242,6 +244,103 @@ def test_deep_finish_and_completed_window_state(
     assert finish[0]["remaining_speculative_tokens"] == 1
     assert finish[0]["crossed_first_window"] is True
     assert request.request_id not in scheduler._mtp_dw_deep_completed_requests
+
+
+@pytest.mark.skip_global_cleanup
+def test_positive_threshold_release_requires_active_sparse_source() -> None:
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.connector = None
+    scheduler.dsa_controller = SimpleNamespace(
+        config=SimpleNamespace(enabled=True, block_size=16)
+    )
+    remove_saved_blocks = Mock(return_value=4)
+    scheduler.kv_cache_manager = SimpleNamespace(
+        remove_saved_decode_window_blocks=remove_saved_blocks
+    )
+    request_id = "resident-request"
+    dsa_state = SimpleNamespace(
+        request_key=object(),
+        route_state=DSARouteState.RESIDENT,
+        active_source_generation_id=None,
+        active_source_receipt_bundle_id=None,
+        initial_prefill_complete=False,
+        remap_end=0,
+        release_end=0,
+    )
+    scheduler.requests = {
+        request_id: SimpleNamespace(
+            dsa_state=dsa_state,
+            all_token_ids=list(range(256)),
+            spec_token_ids=[],
+        )
+    }
+    completed = KVConnectorOutput(
+        completed_decode_window_saves={request_id: 256}
+    )
+
+    scheduler._update_from_kv_xfer_finished(completed)
+
+    remove_saved_blocks.assert_not_called()
+    assert dsa_state.route_state == DSARouteState.RESIDENT
+    pending_key, pending_frontiers = (
+        scheduler._dsa_pending_decode_window_releases[request_id]
+    )
+    assert pending_key is dsa_state.request_key
+    assert list(pending_frontiers) == [256]
+
+    dsa_state.route_state = DSARouteState.SPARSE
+    dsa_state.active_source_generation_id = "generation-1"
+    dsa_state.active_source_receipt_bundle_id = "receipt-1"
+    dsa_state.initial_prefill_complete = True
+    dsa_state.remap_end = 256
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(completed_decode_window_saves={})
+    )
+
+    remove_saved_blocks.assert_called_once_with(
+        request_id,
+        256,
+    )
+    assert dsa_state.release_end == 256
+    assert scheduler._dsa_pending_decode_window_releases == {}
+
+    dsa_state.route_state = DSARouteState.PROMOTING
+    for release_end in (512, 768):
+        scheduler._update_from_kv_xfer_finished(
+            KVConnectorOutput(
+                completed_decode_window_saves={request_id: release_end}
+            )
+        )
+    _, pending_frontiers = scheduler._dsa_pending_decode_window_releases[
+        request_id
+    ]
+    assert list(pending_frontiers) == [512, 768]
+
+    dsa_state.route_state = DSARouteState.SPARSE
+    dsa_state.remap_end = 512
+    scheduler._update_from_kv_xfer_finished(
+        KVConnectorOutput(completed_decode_window_saves={})
+    )
+
+    assert remove_saved_blocks.call_count == 2
+    remove_saved_blocks.assert_called_with(request_id, 512)
+    assert dsa_state.release_end == 512
+    _, pending_frontiers = scheduler._dsa_pending_decode_window_releases[
+        request_id
+    ]
+    assert list(pending_frontiers) == [768]
+
+    invalidated_output = KVConnectorOutput(
+        completed_decode_window_saves={request_id: 1024}
+    )
+    scheduler._update_from_kv_xfer_finished(
+        invalidated_output,
+        blocked_release_req_ids={request_id},
+    )
+
+    assert remove_saved_blocks.call_count == 2
+    assert invalidated_output.completed_decode_window_saves == {}
+    assert scheduler._dsa_pending_decode_window_releases == {}
 
 
 def test_deep_gates_use_configured_first_window(

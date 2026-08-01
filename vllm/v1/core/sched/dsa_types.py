@@ -38,7 +38,6 @@ import enum
 from dataclasses import dataclass, field, replace
 from typing import Literal, Optional
 
-
 # ---------------------------------------------------------------------------
 # Route state machine
 # ---------------------------------------------------------------------------
@@ -791,7 +790,7 @@ def derive_transfer_plan_for_promotion(
     the admission-time import-only plan.
     """
     must_persist = previous.must_persist_decode_windows
-    if deployment_role == "decode":
+    if deployment_role in ("decode", "standalone"):
         must_persist = True
     return replace(
         previous,

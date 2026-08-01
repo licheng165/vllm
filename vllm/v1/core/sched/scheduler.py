@@ -40,6 +40,8 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.sched.dsa_controller import DSAController, DSAControllerConfig
+from vllm.v1.core.sched.dsa_types import DSARouteState, RequestKey
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -53,7 +55,6 @@ from vllm.v1.core.sched.request_queue import (
     create_request_queue,
 )
 from vllm.v1.core.sched.utils import check_stop, remove_all
-from vllm.v1.core.sched.dsa_controller import DSAController, DSAControllerConfig
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
@@ -354,6 +355,9 @@ class Scheduler(SchedulerInterface):
         self.dsa_controller = DSAController(
             config=self._build_dsa_controller_config()
         )
+        self._dsa_pending_decode_window_releases: dict[
+            str, tuple[RequestKey, deque[int]]
+        ] = {}
 
         self.has_mamba_layers = kv_cache_config.has_mamba_layers
         self.needs_kv_cache_zeroing = kv_cache_config.needs_kv_cache_zeroing
@@ -1146,6 +1150,7 @@ class Scheduler(SchedulerInterface):
         # retire the old RequestKey; the request gets a fresh key when it is
         # re-admitted (design section 15.4).
         self.dsa_controller.begin_preemption(request.request_id)
+        self._dsa_pending_decode_window_releases.pop(request.request_id, None)
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
@@ -1777,7 +1782,10 @@ class Scheduler(SchedulerInterface):
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
-            self._update_from_kv_xfer_finished(kv_connector_output)
+            self._update_from_kv_xfer_finished(
+                kv_connector_output,
+                blocked_release_req_ids=failed_kv_load_req_ids,
+            )
 
         # collect KV cache events from KV cache manager
         events = self.kv_cache_manager.take_events()
@@ -2179,6 +2187,7 @@ class Scheduler(SchedulerInterface):
             self._free_blocks(request)
 
         _mtp_dw_cleanup_request(self, request_id)
+        self._dsa_pending_decode_window_releases.pop(request_id, None)
         # Retire the DSA request state so late events/completions for the old
         # RequestKey are rejected as stale (design section 6.3 / 8.3).
         self.dsa_controller.finish_request(request_id)
@@ -2387,7 +2396,10 @@ class Scheduler(SchedulerInterface):
             # DSA two-group mode: group 0 is the MLA latent — the only group the
             # connector offloads (the indexer group stays NPU-resident), so
             # passing block_ids[0] to a non-HMA connector remains correct.
-            assert len(self.kv_cache_config.kv_cache_groups) == 1 or dsa_two_groups_enabled()
+            assert (
+                len(self.kv_cache_config.kv_cache_groups) == 1
+                or dsa_two_groups_enabled()
+            )
             return self.connector.request_finished(request, block_ids[0])
 
         return self.connector.request_finished_all_groups(request, block_ids)
@@ -2482,7 +2494,11 @@ class Scheduler(SchedulerInterface):
             f"{request.status.name} for request {request.request_id}"
         )
 
-    def _update_from_kv_xfer_finished(self, kv_connector_output: KVConnectorOutput):
+    def _update_from_kv_xfer_finished(
+        self,
+        kv_connector_output: KVConnectorOutput,
+        blocked_release_req_ids: set[str] | None = None,
+    ) -> None:
         """
         KV Connector: update the scheduler state based on the output.
 
@@ -2496,12 +2512,38 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
 
-        for req_id, committed_end in (
-            kv_connector_output.completed_decode_window_saves.items()
-        ):
+        if blocked_release_req_ids:
+            for req_id in blocked_release_req_ids:
+                kv_connector_output.completed_decode_window_saves.pop(
+                    req_id, None
+                )
+                pending_releases = getattr(
+                    self, "_dsa_pending_decode_window_releases", None
+                )
+                if pending_releases is not None:
+                    pending_releases.pop(req_id, None)
+
+        pending_releases = getattr(
+            self, "_dsa_pending_decode_window_releases", None
+        )
+        if pending_releases is None:
+            pending_releases = {}
+            self._dsa_pending_decode_window_releases = pending_releases
+        incoming_releases = {
+            req_id: int(committed_end)
+            for req_id, committed_end in (
+                kv_connector_output.completed_decode_window_saves.items()
+            )
+        }
+        release_req_ids = set(incoming_releases) | set(pending_releases)
+        for req_id in release_req_ids:
             request = self.requests.get(req_id)
             if request is None:
-                if _mtp_dw_sample_deep_completion(self, req_id, committed_end):
+                pending_releases.pop(req_id, None)
+                incoming_end = incoming_releases.get(req_id)
+                if incoming_end is not None and _mtp_dw_sample_deep_completion(
+                    self, req_id, incoming_end
+                ):
                     _mtp_dw_event(
                         "deep",
                         event="completed_window_consumed",
@@ -2511,18 +2553,90 @@ class Scheduler(SchedulerInterface):
                         tp_world=None,
                         frontier=None,
                         window_start=max(
-                            0, int(committed_end) - _mtp_dw_window_size()
+                            0, incoming_end - _mtp_dw_window_size()
                         ),
-                        window_end=int(committed_end),
+                        window_end=incoming_end,
                         kv_group=None,
                         request_present=False,
                         status=None,
                     )
                 continue
+            dsa_state = getattr(request, "dsa_state", None)
+            if self.dsa_controller.config.enabled:
+                assert dsa_state is not None
+                pending_key, pending_frontiers = pending_releases.get(
+                    req_id,
+                    (dsa_state.request_key, deque()),
+                )
+                if pending_key != dsa_state.request_key:
+                    pending_frontiers = deque()
+                incoming_end = incoming_releases.get(req_id)
+                if (
+                    incoming_end is not None
+                    and incoming_end > dsa_state.release_end
+                    and incoming_end not in pending_frontiers
+                ):
+                    pending_frontiers = deque(
+                        sorted((*pending_frontiers, incoming_end))
+                    )
+                if not pending_frontiers:
+                    pending_releases.pop(req_id, None)
+                    continue
+                pending_releases[req_id] = (
+                    dsa_state.request_key,
+                    pending_frontiers,
+                )
+                source_activated = (
+                    dsa_state.route_state == DSARouteState.SPARSE
+                    and bool(dsa_state.active_source_generation_id)
+                    and bool(dsa_state.active_source_receipt_bundle_id)
+                    and dsa_state.initial_prefill_complete
+                )
+                eligible_frontiers = (
+                    [
+                        release_end
+                        for release_end in pending_frontiers
+                        if dsa_state.release_end
+                        < release_end
+                        <= dsa_state.remap_end
+                        and release_end % self.dsa_controller.config.block_size == 0
+                    ]
+                    if source_activated
+                    else []
+                )
+                if not eligible_frontiers:
+                    if incoming_end is not None:
+                        logger.warning(
+                            "Deferring decode-window completion until validated DSA "
+                            "source activation: request=%s route_state=%s "
+                            "committed_end=%d remap_end=%s release_end=%s",
+                            req_id,
+                            getattr(dsa_state, "route_state", None),
+                            incoming_end,
+                            getattr(dsa_state, "remap_end", None),
+                            getattr(dsa_state, "release_end", None),
+                        )
+                    continue
+                committed_end = max(eligible_frontiers)
+                while (
+                    pending_frontiers
+                    and pending_frontiers[0] <= committed_end
+                ):
+                    pending_frontiers.popleft()
+                if not pending_frontiers:
+                    pending_releases.pop(req_id, None)
+            else:
+                pending_releases.pop(req_id, None)
+                committed_end = incoming_releases.get(req_id)
+                if committed_end is None:
+                    continue
             removed_blocks = self.kv_cache_manager.remove_saved_decode_window_blocks(
                 req_id,
                 committed_end,
             )
+            if self.dsa_controller.config.enabled:
+                assert dsa_state is not None
+                dsa_state.release_end = committed_end
             _mtp_dw_event(
                 "release",
                 req=req_id,

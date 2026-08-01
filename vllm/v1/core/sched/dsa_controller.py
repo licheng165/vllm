@@ -46,19 +46,19 @@ from vllm.v1.core.sched.dsa_operation_registry import (
     validate_monotonic_raw_source_coverage,
 )
 from vllm.v1.core.sched.dsa_types import (
-    DSAControlEvent,
-    DSAOperationRef,
-    DSARequestState,
-    DSARouteState,
-    DSARouteSnapshot,
-    DSASourceLease,
-    DSATransferPlan,
-    RequestKey,
     WAITING_FOR_DSA_RECOVERY,
     WAITING_FOR_PD_EXPORT,
     WAITING_FOR_PD_IMPORT,
     WAITING_FOR_PREEMPTION_QUIESCE,
     WAITING_FOR_SOURCE_ACTIVATION,
+    DSAControlEvent,
+    DSAOperationRef,
+    DSARequestState,
+    DSARouteSnapshot,
+    DSARouteState,
+    DSASourceLease,
+    DSATransferPlan,
+    RequestKey,
     build_snapshot,
     derive_transfer_plan_for_promotion,
 )
@@ -196,6 +196,10 @@ class DSAController:
                 route_state = DSARouteState.PROMOTING
                 crossed_at = num_tokens
                 reason = "at_or_above_threshold"
+                plan = derive_transfer_plan_for_promotion(
+                    previous=plan,
+                    deployment_role=self.config.node_role,
+                )
             else:
                 route_state = DSARouteState.RESIDENT
                 crossed_at = None

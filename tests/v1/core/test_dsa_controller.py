@@ -108,6 +108,16 @@ def test_route_log_identifies_initial_pd_path_once(
     assert event["accepted_end"] == num_tokens
     assert event["threshold"] == 8192
     assert event["route_authority"] == "scheduler_state"
+    assert state.transfer_plan.must_persist_decode_windows is (
+        node_role == "decode" and num_tokens >= 8192
+    )
+
+
+def test_standalone_promotion_requires_decode_window_persistence() -> None:
+    controller = _make_controller("standalone")
+    state = controller.initialize_state("request-standalone", 8192)
+
+    assert state.transfer_plan.must_persist_decode_windows is True
 
 
 def test_route_log_request_id_is_opt_in(
