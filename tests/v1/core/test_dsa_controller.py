@@ -31,7 +31,9 @@ def _make_controller(node_role: str = "decode") -> DSAController:
             query_width=2,
             scratch_capacity=4096,
             node_role=node_role,
-            deployment_mode="pd",
+            deployment_mode=(
+                "standalone" if node_role == "standalone" else "pd"
+            ),
             data_compatibility_fingerprint="data-fingerprint",
             instance_capability_digest="instance-digest",
         ),
@@ -108,6 +110,11 @@ def test_route_log_identifies_initial_pd_path_once(
     assert event["accepted_end"] == num_tokens
     assert event["threshold"] == 8192
     assert event["route_authority"] == "scheduler_state"
+    assert state.transfer_plan.must_import_prefix is (node_role == "decode")
+    assert state.transfer_plan.must_export_prefill is (node_role == "prefill")
+    assert state.transfer_plan.remote_handoff_required is (
+        node_role == "prefill"
+    )
     assert state.transfer_plan.must_persist_decode_windows is (
         node_role == "decode" and num_tokens >= 8192
     )
@@ -117,6 +124,38 @@ def test_standalone_promotion_requires_decode_window_persistence() -> None:
     controller = _make_controller("standalone")
     state = controller.initialize_state("request-standalone", 8192)
 
+    assert state.transfer_plan.must_persist_decode_windows is True
+
+
+def test_disabled_config_preserves_pd_transfer_role() -> None:
+    config = DSAControllerConfig.disabled(
+        block_size=128,
+        chunk_size=256,
+        node_role="decode",
+        deployment_mode="pd",
+    )
+    controller = DSAController(config, process_instance_id="scheduler-process")
+
+    state = controller.initialize_state("request-legacy-pd", 1024)
+
+    assert config.deployment_mode == "pd"
+    assert state.transfer_plan.must_import_prefix is True
+    assert state.transfer_plan.must_export_prefill is False
+    assert state.transfer_plan.must_persist_decode_windows is False
+
+
+def test_accepted_end_crosses_threshold_before_completion_frontier() -> None:
+    controller = _make_controller("decode")
+    state = controller.initialize_state("request-crossing", 8191)
+    controller.attach_state(state)
+
+    controller.consume_accepted_end("request-crossing", 8192)
+
+    assert state.route_state.value == "promoting"
+    assert state.threshold_crossed_at == 8192
+    assert state.completed_canonical_end == 0
+    assert state.promotion_desired_end == 0
+    assert state.transfer_plan.must_import_prefix is True
     assert state.transfer_plan.must_persist_decode_windows is True
 
 

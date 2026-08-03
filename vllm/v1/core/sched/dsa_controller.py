@@ -7,8 +7,9 @@ hooks at well-defined points:
 
 * :meth:`DSAController.initialize_state` -- at request admission.
 * :meth:`DSAController.consume_completed_execution` -- after a model output is
-  accepted and ``all_token_ids`` is updated; refreshes ``C``/``E`` and detects
-  threshold crossing.
+  accepted; refreshes worker-confirmed ``C``/``E``.
+* :meth:`DSAController.consume_accepted_end` -- after ``all_token_ids`` is
+  updated; detects threshold crossing from the accepted frontier ``A``.
 * :meth:`DSAController.maybe_advance` -- each step; submits / advances
   promotion / window operations subject to the single-in-flight-per-lane rule.
 * :meth:`DSAController.consume_event` -- consume a DSA control event
@@ -60,6 +61,7 @@ from vllm.v1.core.sched.dsa_types import (
     DSATransferPlan,
     RequestKey,
     build_snapshot,
+    derive_transfer_plan_for_admission,
     derive_transfer_plan_for_promotion,
 )
 
@@ -119,6 +121,7 @@ class DSAControllerConfig:
         block_size: int,
         chunk_size: int,
         node_role: str = "standalone",
+        deployment_mode: str = "standalone",
     ) -> "DSAControllerConfig":
         return cls(
             threshold=0,
@@ -130,7 +133,7 @@ class DSAControllerConfig:
             query_width=1,
             scratch_capacity=0,
             node_role=node_role,
-            deployment_mode="standalone",
+            deployment_mode=deployment_mode,
             data_compatibility_fingerprint="",
             instance_capability_digest="",
         )
@@ -180,7 +183,14 @@ class DSAController:
         """
         threshold = self.config.threshold
         key = self._new_request_key(request_id)
-        plan = transfer_plan or DSATransferPlan()
+        plan = (
+            transfer_plan
+            if transfer_plan is not None
+            else derive_transfer_plan_for_admission(
+                self.config.deployment_mode,
+                self.config.node_role,
+            )
+        )
 
         if threshold == 0:
             reason = "threshold_disabled"
@@ -244,7 +254,6 @@ class DSAController:
             # Stale completion for an old incarnation: ignore (do not mutate).
             return
 
-        prev_c = state.completed_canonical_end
         state.completed_canonical_end = max(
             state.completed_canonical_end, receipt.completed_canonical_end
         )
@@ -259,39 +268,40 @@ class DSAController:
                 align_down(state.completed_canonical_end, self.config.chunk_size),
             )
 
-        # Threshold crossing: RESIDENT -> PROMOTING (design 9.2).
-        # ``accepted_context_len`` is the current scope's token count, derived
-        # from completed canonical + newly accepted output; the caller passes
-        # it via receipt.completed_canonical_end relative to this scope.  We
-        # compare the *accepted* length (prompt + accepted output) which is
-        # >= completed_canonical_end; use the receipt's canonical end as the
-        # authoritative lower bound plus the live tail.
+        # This is only a lower-bound fallback. The Scheduler separately calls
+        # consume_accepted_end with request.num_tokens after accepting output.
+        self.consume_accepted_end(request_id, receipt.completed_canonical_end)
+
+    def consume_accepted_end(self, request_id: str, accepted_end: int) -> None:
+        """Detect RESIDENT -> PROMOTING from the post-acceptance token end."""
+        state = self._lookup_state(request_id)
+        if state is None:
+            return
         if (
             state.route_state == DSARouteState.RESIDENT
             and self.config.enabled
+            and accepted_end >= state.threshold
         ):
-            accepted = max(receipt.completed_canonical_end, prev_c)
-            if accepted >= state.threshold:
-                previous_state = state.route_state
-                state.transfer_plan = derive_transfer_plan_for_promotion(
-                    previous=state.transfer_plan,
-                    deployment_role=self.config.node_role,
-                )
-                state.route_state = DSARouteState.PROMOTING
-                state.threshold_crossed_at = accepted
-                state.promotion_desired_end = max(
-                    state.promotion_desired_end,
-                    align_down(
-                        state.completed_canonical_end, self.config.chunk_size
-                    ),
-                )
-                state.route_epoch += 1
-                self._emit(
-                    state,
-                    previous_state=previous_state,
-                    reason="context_threshold_crossed",
-                    accepted_end=accepted,
-                )
+            previous_state = state.route_state
+            state.transfer_plan = derive_transfer_plan_for_promotion(
+                previous=state.transfer_plan,
+                deployment_role=self.config.node_role,
+            )
+            state.route_state = DSARouteState.PROMOTING
+            state.threshold_crossed_at = accepted_end
+            state.promotion_desired_end = max(
+                state.promotion_desired_end,
+                align_down(
+                    state.completed_canonical_end, self.config.chunk_size
+                ),
+            )
+            state.route_epoch += 1
+            self._emit(
+                state,
+                previous_state=previous_state,
+                reason="context_threshold_crossed",
+                accepted_end=accepted_end,
+            )
 
     def _lookup_state(self, request_id: str) -> Optional[DSARequestState]:
         # The caller (Scheduler) holds the authoritative DSARequestState on

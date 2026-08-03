@@ -481,6 +481,11 @@ class Scheduler(SchedulerInterface):
                 node_role=str(dsa_cfg.get("node_role", "standalone"))
                 if isinstance(dsa_cfg, dict)
                 else "standalone",
+                deployment_mode=str(
+                    dsa_cfg.get("deployment_mode", "standalone")
+                )
+                if isinstance(dsa_cfg, dict)
+                else "standalone",
             )
         return DSAControllerConfig(
             threshold=int(dsa_cfg["threshold"]),
@@ -1942,6 +1947,11 @@ class Scheduler(SchedulerInterface):
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
+        if self.dsa_controller.config.enabled:
+            self.dsa_controller.consume_accepted_end(
+                request.request_id,
+                request.num_tokens,
+            )
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:

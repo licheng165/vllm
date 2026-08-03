@@ -151,6 +151,26 @@ class DSATransferPlan:
     remote_handoff_required: bool = False
 
 
+def derive_transfer_plan_for_admission(
+    deployment_mode: str,
+    node_role: str,
+) -> DSATransferPlan:
+    """Build the immutable transfer obligations for a newly admitted request."""
+    if deployment_mode == "standalone" and node_role == "standalone":
+        return DSATransferPlan()
+    if deployment_mode == "pd" and node_role == "prefill":
+        return DSATransferPlan(
+            must_export_prefill=True,
+            remote_handoff_required=True,
+        )
+    if deployment_mode == "pd" and node_role == "decode":
+        return DSATransferPlan(must_import_prefix=True)
+    raise ValueError(
+        "Invalid DSA deployment configuration: "
+        f"deployment_mode={deployment_mode!r}, node_role={node_role!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # PD transfer context
 # ---------------------------------------------------------------------------
