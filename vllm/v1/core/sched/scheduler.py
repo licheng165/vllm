@@ -501,6 +501,51 @@ class Scheduler(SchedulerInterface):
             ),
         )
 
+    def _attach_dsa_route_snapshots(
+        self, scheduler_output: SchedulerOutput
+    ) -> None:
+        """Attach authoritative DSA routes before connector metadata is built."""
+        scheduled_ids = list(scheduler_output.num_scheduled_tokens)
+        if not scheduled_ids:
+            return
+        if not self.dsa_controller.config.enabled and not any(
+            request.dsa_request_key is not None
+            for request in scheduler_output.scheduled_new_reqs
+        ):
+            return
+
+        missing_state_ids = [
+            req_id
+            for req_id in scheduled_ids
+            if req_id in self.requests
+            and getattr(self.requests[req_id], "dsa_state", None) is None
+        ]
+        if missing_state_ids and self.dsa_controller.config.enabled:
+            raise RuntimeError(
+                "DSA routing state is missing for scheduled requests "
+                f"{missing_state_ids}. Custom schedulers must delegate request "
+                "admission to Scheduler.add_request()."
+            )
+
+        accepted_ends = {
+            req_id: self.requests[req_id].num_tokens
+            for req_id in scheduled_ids
+            if req_id in self.requests
+        }
+        snapshots = self.dsa_controller.build_route_snapshots(
+            scheduled_ids, accepted_ends
+        )
+        if not snapshots:
+            return
+
+        scheduler_output.dsa_routes = snapshots
+        scheduler_output.dsa_data_compatibility_fingerprint = (
+            self.dsa_controller.config.data_compatibility_fingerprint or None
+        )
+        scheduler_output.dsa_instance_capability_digest = (
+            self.dsa_controller.config.instance_capability_digest or None
+        )
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1078,36 +1123,9 @@ class Scheduler(SchedulerInterface):
             new_block_ids_to_zero=new_block_ids_to_zero,
         )
 
-        # Attach DSA route snapshots so workers/connectors consume the
-        # authoritative route decision and do NOT re-derive sparse mode from
-        # prompt_len (design section 8.2 / 10.1).  Only populated when the
-        # threshold state machine is enabled; LEGACY requests still carry a
-        # snapshot so safety machinery is consistent.
-        if self.dsa_controller.config.enabled or any(
-            getattr(r, "dsa_state", None) is not None
-            for r in scheduled_new_reqs
-        ):
-            scheduled_ids = list(num_scheduled_tokens.keys())
-            accepted_ends = {
-                rid: self.requests[rid].num_tokens
-                for rid in scheduled_ids
-                if rid in self.requests
-            }
-            snapshots = self.dsa_controller.build_route_snapshots(
-                scheduled_ids, accepted_ends
-            )
-            if snapshots:
-                scheduler_output.dsa_routes = {
-                    rid: snap for rid, snap in snapshots.items()
-                }
-                scheduler_output.dsa_data_compatibility_fingerprint = (
-                    self.dsa_controller.config.data_compatibility_fingerprint
-                    or None
-                )
-                scheduler_output.dsa_instance_capability_digest = (
-                    self.dsa_controller.config.instance_capability_digest
-                    or None
-                )
+        # This shared hook is also used by Ascend scheduler subclasses that
+        # construct SchedulerOutput themselves.
+        self._attach_dsa_route_snapshots(scheduler_output)
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
         # 1. Plan the KV cache store

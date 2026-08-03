@@ -26,6 +26,7 @@ from vllm.utils.hashing import sha256
 from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched import scheduler as scheduler_module
+from vllm.v1.core.sched.dsa_controller import DSAController, DSAControllerConfig
 from vllm.v1.core.sched.dsa_types import DSARouteState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -51,6 +52,50 @@ def test_add_requests():
         scheduler.add_request(request)
         assert request.request_id in scheduler.requests
         assert len(scheduler.waiting) == i + 1
+
+
+@pytest.mark.skip_global_cleanup
+def test_scheduler_output_carries_dsa_lifecycle_identity() -> None:
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.requests = {}
+    scheduler.log_stats = False
+    scheduler._enqueue_waiting_request = Mock()
+    scheduler.dsa_controller = DSAController(
+        config=DSAControllerConfig(
+            threshold=64,
+            max_model_len=1024,
+            block_size=16,
+            chunk_size=256,
+            window_size=256,
+            index_topk=32,
+            query_width=1,
+            scratch_capacity=32,
+            node_role="standalone",
+            deployment_mode="standalone",
+            data_compatibility_fingerprint="data-fingerprint",
+            instance_capability_digest="instance-digest",
+        )
+    )
+    request = SimpleNamespace(
+        request_id="long-request",
+        resumable=False,
+        num_tokens=128,
+        dsa_state=None,
+    )
+    scheduler.add_request(request)
+
+    assert request.dsa_state is not None
+    assert request.dsa_state.route_state == DSARouteState.PROMOTING
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {request.request_id: 1}
+    scheduler_output.total_num_scheduled_tokens = 1
+    scheduler._attach_dsa_route_snapshots(scheduler_output)
+
+    assert scheduler_output.dsa_routes is not None
+    route = scheduler_output.dsa_routes[request.request_id]
+    assert route.request_key == request.dsa_state.request_key
+    assert route.route_state == DSARouteState.PROMOTING
 
 
 def test_finish_request():
