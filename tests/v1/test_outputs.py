@@ -1,8 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+from typing import Any, cast
 from unittest import TestCase
 
-from vllm.v1.outputs import LogprobsLists
+import pytest
+
+from vllm.v1.core.sched.dsa_types import (
+    DSAControlEvent,
+    DSAOperationReceipt,
+    RequestKey,
+)
+from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
+from vllm.v1.outputs import KVConnectorOutput, LogprobsLists, ModelRunnerOutput
+
+pytestmark = pytest.mark.cpu_test
 
 
 class TestLogprobsLists(TestCase):
@@ -97,3 +109,82 @@ class TestLogprobsLists(TestCase):
         assert len(sliced.logprob_token_ids) == 9  # All tokens
         assert sliced.logprob_token_ids == self.logprobsLists.logprob_token_ids
         assert sliced.cu_num_generated_tokens is None
+
+
+def test_kv_connector_output_dsa_only_is_not_empty() -> None:
+    receipt = cast(DSAOperationReceipt, object())
+    event = cast(DSAControlEvent, object())
+
+    assert KVConnectorOutput().is_empty()
+    assert not KVConnectorOutput(dsa_receipts=(receipt,)).is_empty()
+    assert not KVConnectorOutput(dsa_events=(event,)).is_empty()
+
+
+def test_kv_connector_output_merge_preserves_dsa_order() -> None:
+    receipt_1 = cast(DSAOperationReceipt, object())
+    receipt_2 = cast(DSAOperationReceipt, object())
+    event_1 = cast(DSAControlEvent, object())
+    event_2 = cast(DSAControlEvent, object())
+
+    merged = KVConnectorOutput.merge(
+        KVConnectorOutput(
+            dsa_receipts=(receipt_1, receipt_2),
+            dsa_events=(event_1,),
+        ),
+        KVConnectorOutput(
+            dsa_receipts=(receipt_1,),
+            dsa_events=(event_2, event_1),
+        ),
+    )
+
+    assert merged.dsa_receipts == (receipt_1, receipt_2, receipt_1)
+    assert merged.dsa_events == (event_1, event_2, event_1)
+
+
+def test_model_runner_output_dsa_execution_receipts_default() -> None:
+    output_1 = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+    output_2 = ModelRunnerOutput(req_ids=[], req_id_to_index={})
+
+    assert output_1.dsa_execution_receipts == {}
+    assert output_1.dsa_execution_receipts is not output_2.dsa_execution_receipts
+
+
+def test_scheduler_output_dsa_defaults() -> None:
+    output_1 = SchedulerOutput.make_empty()
+    output_2 = SchedulerOutput.make_empty()
+
+    assert output_1.dsa_routes == {}
+    assert output_1.dsa_routes is not output_2.dsa_routes
+    assert output_1.dsa_commands == ()
+    assert output_1.dsa_connector_only_imports == ()
+    assert output_1.dsa_preemption_actions == ()
+
+
+def test_request_data_preserves_request_keys() -> None:
+    request_key = RequestKey("process", "request", 1)
+    request = SimpleNamespace(
+        request_id="request",
+        prompt_token_ids=[1],
+        mm_features=[],
+        sampling_params=None,
+        pooling_params=None,
+        num_computed_tokens=0,
+        lora_request=None,
+        prompt_embeds=None,
+        dsa_state=SimpleNamespace(request_key=request_key),
+    )
+
+    new_request = NewRequestData.from_request(cast(Any, request), ([],))
+    cached_request = CachedRequestData(
+        req_ids=["request"],
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[],
+        num_computed_tokens=[0],
+        num_output_tokens=[0],
+        dsa_request_keys={"request": request_key},
+    )
+
+    assert new_request.dsa_request_key is request_key
+    assert cached_request.dsa_request_keys == {"request": request_key}

@@ -309,6 +309,34 @@ class DSASourceLease:
     source_generation_id: str
 
 
+@dataclass(frozen=True)
+class DSAExecutionReceipt:
+    """Worker-confirmed completion frontier for one scheduled request."""
+
+    request_key: RequestKey
+    execution_seq: int
+    route_epoch: int
+    accepted_end_at_execution: int
+    completed_canonical_end: int
+    external_computed_end: int
+    initial_prefill_complete: bool
+    min_position_of_next_target_rows: int
+    token_prefix_digest: str
+    released_source_lease_id: str | None = None
+
+
+@dataclass(frozen=True)
+class DSAExecutionExpectation:
+    """Scheduler-owned binding for one emitted route snapshot."""
+
+    execution_seq: int
+    route_epoch: int
+    accepted_end_at_execution: int
+    maximum_completed_canonical_end: int
+    token_prefix_digest: str
+    source_lease_id: str | None
+
+
 ReceiptKind = Literal[
     "storage",
     "source_seal",
@@ -344,7 +372,7 @@ class DSAReceiptExpectation:
     layers: tuple[int, ...]
     chunks: tuple[tuple[int, int], ...]
     storage_tier: StorageTier
-    minimum_guarantee: str
+    minimum_guarantee: Guarantee
 
 
 @dataclass(frozen=True)
@@ -387,7 +415,8 @@ class DSAOperationReceipt:
     storage_tier: StorageTier
     status: Literal["complete", "failed"]
     lease_descriptor_id: Optional[str]
-    guarantee: Guarantee
+    guarantee: Optional[Guarantee]
+    error_code: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -414,6 +443,32 @@ class DSAReceiptBundle:
     sparse_source_end: int
     materialized_end: int
     lease_descriptor_id: Optional[str]
+    error_code: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class DSALatentReleasePlan:
+    """Validated activation result awaiting the Scheduler's KV transaction.
+
+    Building this plan does not change the active route or any release
+    frontier. The Scheduler first prepares and commits the corresponding KV
+    release transaction, then asks the controller to commit this plan.
+    """
+
+    request_key: RequestKey
+    activation_operation_id: str
+    activation_bundle_id: str
+    store_operation_id: str
+    store_bundle_id: str
+    transition_kind: Literal["promotion", "window"]
+    source_generation_id: str
+    token_prefix_digest: str
+    raw_source_end: int
+    sparse_source_end: int
+    remap_end: int
+    release_end: int
+    next_route_epoch: int
+    next_window_start: int
 
 
 @dataclass
@@ -429,6 +484,7 @@ class DSAOperationRecord:
     receipts_by_expectation: dict[tuple, DSAOperationReceipt] = field(
         default_factory=dict
     )
+    receipts_by_id: dict[str, DSAOperationReceipt] = field(default_factory=dict)
     status: Literal[
         "issued", "collecting", "ready", "activating",
         "committed", "failed", "superseded",
@@ -438,6 +494,7 @@ class DSAOperationRecord:
         default_factory=dict
     )
     bundle_id: Optional[str] = None
+    bundle: Optional[DSAReceiptBundle] = None
     error_code: Optional[str] = None
 
     @property
@@ -660,10 +717,19 @@ class DSARequestState:
     route_state: DSARouteState
     route_epoch: int
     threshold: int
+    initial_prompt_end: int = 0
+    accepted_end: int = 0
     threshold_crossed_at: Optional[int] = None
     completed_canonical_end: int = 0
     external_computed_end: int = 0
     initial_prefill_complete: bool = False
+    min_position_of_next_target_rows: int = 0
+    token_prefix_digest: str | None = None
+    last_issued_execution_seq: int = 0
+    last_completed_execution_seq: int = 0
+    pending_executions: dict[int, DSAExecutionExpectation] = field(
+        default_factory=dict
+    )
     raw_source_end: int = 0
     sparse_source_end: int = 0
     remap_end: int = 0
@@ -677,7 +743,9 @@ class DSARequestState:
     recovery_inflight: Optional[DSAOperationRef] = None
     preemption_inflight: Optional[DSAOperationRef] = None
     latest_sealed_generation_id: Optional[str] = None
+    latest_sealed_operation_id: str | None = None
     latest_sealed_receipt_bundle_id: Optional[str] = None
+    latest_sealed_token_prefix_digest: str | None = None
     latest_sealed_raw_source_end: int = 0
     latest_sealed_sparse_source_end: int = 0
     active_source_generation_id: Optional[str] = None

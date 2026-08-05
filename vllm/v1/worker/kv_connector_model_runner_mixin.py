@@ -78,11 +78,17 @@ class KVConnectorModelRunnerMixin:
         )
 
     @staticmethod
-    def finalize_kv_connector() -> dict[str, int]:
-        """Finalize the KV connector: wait_for_save and clear metadata.
+    def finalize_kv_connector(
+        output: KVConnectorOutput | None = None,
+    ) -> KVConnectorOutput:
+        """Wait for pending saves, drain final output, and clear metadata.
 
-        Call after draft model forward when defer_finalize=True was used.
+        Call after draft model forward when defer_finalize=True was used. Passing
+        its earlier output preserves notifications drained before the final fence.
         """
+        if output is None:
+            output = KVConnectorOutput()
+
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
             try:
@@ -90,14 +96,21 @@ class KVConnectorModelRunnerMixin:
                 get_completed_decode_window_saves = getattr(
                     kv_connector, "get_completed_decode_window_saves", None
                 )
-                return (
+                completed_decode_window_saves = (
                     get_completed_decode_window_saves()
                     if get_completed_decode_window_saves is not None
                     else {}
                 )
+                for req_id, window_end in completed_decode_window_saves.items():
+                    output.completed_decode_window_saves[req_id] = max(
+                        output.completed_decode_window_saves.get(req_id, 0),
+                        window_end,
+                    )
+                output.dsa_receipts += tuple(kv_connector.get_dsa_operation_receipts())
+                output.dsa_events += tuple(kv_connector.get_dsa_control_events())
             finally:
                 kv_connector.clear_connector_metadata()
-        return {}
+        return output
 
     # This context manager must be used within an active forward context.
     # It encapsulates the entire KV connector lifecycle within execute_model
@@ -140,6 +153,8 @@ class KVConnectorModelRunnerMixin:
                     output.completed_decode_window_saves = (
                         get_completed_decode_window_saves()
                     )
+                output.dsa_receipts = tuple(kv_connector.get_dsa_operation_receipts())
+                output.dsa_events = tuple(kv_connector.get_dsa_control_events())
 
                 output.kv_connector_stats = kv_connector.get_kv_connector_stats()
                 output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()

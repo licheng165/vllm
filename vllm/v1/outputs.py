@@ -18,7 +18,15 @@ if TYPE_CHECKING:
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+    from vllm.v1.core.sched.dsa_types import (
+        DSAControlEvent,
+        DSAExecutionReceipt,
+        DSAOperationReceipt,
+    )
 else:
+    DSAControlEvent = object
+    DSAExecutionReceipt = object
+    DSAOperationReceipt = object
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
     KVConnectorKVEvents = object
@@ -159,15 +167,10 @@ class KVConnectorOutput:
     # It captures a static setup info and should almost always remain constant
     # for a given connector after discovery. Default value entails no change.
     expected_finished_count: int = 0
-    # DSA individual worker receipts.  Individual workers only emit receipts;
-    # the executor aggregates into bundles by exact-set quorum (design 8.3).
-    # Typed as object to avoid importing dsa_types here (avoids a cycle); the
-    # concrete type is vllm.v1.core.sched.dsa_types.DSAOperationReceipt.
-    dsa_receipts: tuple[object, ...] = ()
-    # DSA executor-aggregated receipt bundles.
-    dsa_bundles: tuple[object, ...] = ()
+    # Individual workers emit receipts; the executor performs quorum aggregation.
+    dsa_receipts: tuple[DSAOperationReceipt, ...] = ()
     # DSA control events emitted to the Scheduler.
-    dsa_events: tuple[object, ...] = ()
+    dsa_events: tuple[DSAControlEvent, ...] = ()
 
     def is_empty(self):
         return (
@@ -178,6 +181,8 @@ class KVConnectorOutput:
             and not self.invalid_block_ids
             and not self.completed_decode_window_saves
             and not self.kv_connector_worker_meta
+            and not self.dsa_receipts
+            and not self.dsa_events
         )
 
     @classmethod
@@ -214,6 +219,10 @@ class KVConnectorOutput:
             for output in outputs
         )
         expected_finished_count = outputs[0].expected_finished_count
+        dsa_receipts = tuple(
+            receipt for output in outputs for receipt in output.dsa_receipts
+        )
+        dsa_events = tuple(event for output in outputs for event in output.dsa_events)
 
         return cls(
             finished_sending=finished_sending,
@@ -223,6 +232,8 @@ class KVConnectorOutput:
             invalid_block_ids=invalid_block_ids,
             completed_decode_window_saves=completed_decode_window_saves,
             expected_finished_count=expected_finished_count,
+            dsa_receipts=dsa_receipts,
+            dsa_events=dsa_events,
         )
 
 
@@ -273,6 +284,9 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # req_id -> worker-confirmed completion frontier.
+    dsa_execution_receipts: dict[str, DSAExecutionReceipt] = field(default_factory=dict)
 
 
 # ModelRunnerOutput wrapper for async scheduling.

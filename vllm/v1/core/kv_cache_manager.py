@@ -11,6 +11,8 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.sched.dsa_types import RequestKey
+from vllm.v1.core.single_type_kv_cache_manager import DSALatentManager
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
@@ -424,9 +426,10 @@ class KVCacheManager:
 
     def prepare_dsa_release(
         self,
-        request_key: object,
+        request_key: RequestKey,
         proposed_end: int,
-        source_generation_id: str | None,
+        source_generation_id: str,
+        request: Request,
     ) -> "DSALatentReleaseTransaction":
         """Prepare a RequestKey-aware, validated DSA latent release.
 
@@ -439,21 +442,25 @@ class KVCacheManager:
         The worker must NEVER release latent on its own; only the Scheduler
         commits release after source-activation quorum (design section 9.3).
         """
-        # ``request_key`` is a dsa_types.RequestKey; we use its string form as
-        # the request_id into the per-manager maps.
-        request_id = (
-            getattr(request_key, "request_id", None)
-            if not isinstance(request_key, str)
-            else request_key
-        )
-        if request_id is None:
-            raise ValueError("prepare_dsa_release requires a RequestKey or str")
+        if not isinstance(request_key, RequestKey):
+            raise ValueError("prepare_dsa_release requires a RequestKey")
+        request_id = request_key.request_id
+        latent_block_sizes = {
+            cache_manager.block_size
+            for cache_manager in self.coordinator.single_type_managers
+            if isinstance(cache_manager, DSALatentManager)
+        }
+        if len(latent_block_sizes) != 1:
+            raise ValueError(
+                "prepare_dsa_release requires one consistent latent block size"
+            )
         txn = DSALatentReleaseTransaction(
             request_id=request_id,
             request_key=request_key,
             proposed_end=int(proposed_end),
             source_generation_id=source_generation_id,
-            block_size=self.block_pool.block_size,
+            block_size=next(iter(latent_block_sizes)),
+            current_request=request,
         )
         txn.validate(self)
         return txn
@@ -629,11 +636,13 @@ class DSALatentReleaseTransaction:
     """
 
     request_id: str
-    request_key: object
+    request_key: RequestKey
     proposed_end: int
-    source_generation_id: str | None
+    source_generation_id: str
     block_size: int
+    current_request: Request
     committed_release: int = 0
+    freed_blocks: int = 0
     _validated: bool = False
 
     def validate(self, manager: KVCacheManager) -> None:
@@ -648,9 +657,87 @@ class DSALatentReleaseTransaction:
                 f"block-aligned (block_size={self.block_size}) for "
                 f"{self.request_id}"
             )
-        # scratch floor is enforced inside the manager's release helper via
-        # DSALatentManager.scratch_blocks; an under-scratch proposed_end simply
-        # frees zero blocks (no reclaim benefit) rather than corrupting state.
+        if not isinstance(self.request_key, RequestKey):
+            raise ValueError("DSA release requires a RequestKey")
+        if self.request_key.request_id != self.request_id:
+            raise ValueError("DSA release RequestKey request ID mismatch")
+        if not self.source_generation_id:
+            raise ValueError("DSA release requires a source generation")
+
+        previous_release_end = 0
+        if self.current_request is None:
+            raise ValueError("DSA release requires the current request")
+        if self.current_request.request_id != self.request_id:
+            raise ValueError("DSA release current request ID mismatch")
+        state = getattr(self.current_request, "dsa_state", None)
+        if state is None or state.request_key != self.request_key:
+            raise ValueError("DSA release targets a stale request lifecycle")
+        if state.source_activation_inflight is None:
+            raise ValueError("DSA release has no active source activation")
+        if (
+            state.source_activation_inflight.input_generation_id
+            != self.source_generation_id
+            or state.latest_sealed_generation_id != self.source_generation_id
+        ):
+            raise ValueError("DSA release source generation mismatch")
+        if state.source_activation_inflight.range_end != self.proposed_end:
+            raise ValueError("DSA release frontier does not match activation")
+        if not state.initial_prefill_complete:
+            raise ValueError("DSA release requires completed initial prefill")
+        if self.proposed_end > min(
+            state.latest_sealed_sparse_source_end,
+            state.completed_canonical_end,
+        ):
+            raise ValueError("DSA release exceeds a verified source frontier")
+        if self.proposed_end <= state.release_end:
+            raise ValueError("DSA release frontier did not advance")
+        previous_release_end = state.release_end
+
+        latent_managers = tuple(
+            cache_manager
+            for cache_manager in manager.coordinator.single_type_managers
+            if isinstance(cache_manager, DSALatentManager)
+        )
+        if not latent_managers:
+            raise ValueError("DSA release requires a latent KV cache group")
+        for latent_manager in latent_managers:
+            if latent_manager.block_size != self.block_size:
+                raise ValueError("DSA latent groups use inconsistent block sizes")
+            blocks = latent_manager.req_to_blocks.get(self.request_id)
+            if not blocks:
+                raise ValueError("DSA release request owns no latent blocks")
+            release_block_end = self.proposed_end // self.block_size
+            if release_block_end > len(blocks):
+                raise ValueError("DSA release exceeds the request block table")
+            scratch_block_end = latent_manager.scratch_blocks
+            if release_block_end < scratch_block_end:
+                raise ValueError("DSA release frontier is below the scratch floor")
+            previous_block_end = max(
+                scratch_block_end,
+                previous_release_end // self.block_size,
+            )
+            null_block = latent_manager._null_block
+            if any(
+                blocks[index] != null_block
+                for index in range(scratch_block_end, previous_block_end)
+            ):
+                raise ValueError("previous DSA release range contains live blocks")
+            live_reference_counts: dict[int, int] = {}
+            for owned_blocks in latent_manager.req_to_blocks.values():
+                for owned_block in owned_blocks:
+                    if owned_block != null_block:
+                        identity = id(owned_block)
+                        live_reference_counts[identity] = (
+                            live_reference_counts.get(identity, 0) + 1
+                        )
+            for index in range(previous_block_end, release_block_end):
+                block = blocks[index]
+                if block == null_block:
+                    raise ValueError("DSA release range contains an uncommitted hole")
+                if block.ref_cnt <= 0:
+                    raise ValueError("DSA release range contains an unowned block")
+                if live_reference_counts[id(block)] != 1:
+                    raise ValueError("DSA release range contains an aliased block")
         self._validated = True
 
     def commit(self, manager: KVCacheManager) -> int:
@@ -658,11 +745,11 @@ class DSALatentReleaseTransaction:
             raise RuntimeError(
                 "DSALatentReleaseTransaction.commit called before validate"
             )
-        freed = manager.remove_saved_decode_window_blocks(
+        self.freed_blocks = manager.remove_saved_decode_window_blocks(
             self.request_id, self.proposed_end
         )
-        self.committed_release = freed
-        return freed
+        self.committed_release = self.proposed_end
+        return self.committed_release
 
     def commit_no_fail(self, manager: KVCacheManager) -> int:
         # Alias documenting the "no-fail post-validation commit" contract.

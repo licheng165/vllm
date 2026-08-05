@@ -63,6 +63,11 @@ if TYPE_CHECKING:
     )
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.dsa_types import (
+        DSAControlEvent,
+        DSAOperationReceipt,
+        DSASourceLease,
+    )
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -397,6 +402,18 @@ class KVConnectorBase_V1(ABC):
               pass in which they are detected.
         """
         return set()
+
+    def get_dsa_operation_receipts(self) -> Iterable["DSAOperationReceipt"]:
+        """Drain DSA operation receipts emitted since the previous call."""
+        return ()
+
+    def get_dsa_control_events(self) -> Iterable["DSAControlEvent"]:
+        """Drain DSA control events emitted since the previous call."""
+        return ()
+
+    def get_released_dsa_source_leases(self) -> Iterable["DSASourceLease"]:
+        """Drain source leases released after their final worker fence."""
+        return ()
 
     def shutdown(self):
         """

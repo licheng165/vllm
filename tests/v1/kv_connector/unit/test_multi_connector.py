@@ -790,6 +790,28 @@ Options:
 """)
 
 
+@pytest.mark.parametrize(
+    "method_name",
+    (
+        "get_dsa_operation_receipts",
+        "get_dsa_control_events",
+        "get_released_dsa_source_leases",
+    ),
+)
+def test_multi_connector_drains_dsa_output_in_child_order(
+    mc: MultiConnector,
+    method_name: str,
+) -> None:
+    first = object()
+    second = object()
+    getattr(mc._connectors[0], method_name).return_value = (first, first)
+    getattr(mc._connectors[1], method_name).return_value = (second,)
+
+    assert tuple(getattr(mc, method_name)()) == (first, first, second)
+    getattr(mc._connectors[0], method_name).assert_called_once_with()
+    getattr(mc._connectors[1], method_name).assert_called_once_with()
+
+
 def test_multi_connector_prefer_cross_layer_blocks(mc):
     mc._connectors[0].prefer_cross_layer_blocks = False
     mc._connectors[1].prefer_cross_layer_blocks = True

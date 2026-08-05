@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -16,13 +16,25 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.sched.dsa_types import (
+        DSAConnectorOnlyImport,
+        DSAOperationCommand,
+        DSAPreemptionAction,
+        DSARouteSnapshot,
+        RequestKey,
+    )
     from vllm.v1.request import Request
 else:
+    DSAConnectorOnlyImport = object
+    DSAOperationCommand = object
+    DSAPreemptionAction = object
+    DSARouteSnapshot = object
     ECConnectorMetadata = object
     KVConnectorMetadata = object
     LoRARequest = object
     MultiModalFeatureSpec = object
     PoolingParams = object
+    RequestKey = object
     SamplingParams = object
     Request = object
 
@@ -42,11 +54,10 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
-    # DSA process-incarnation-aware request key (string form of
-    # RequestKey).  Carried so workers/connectors can match the authoritative
-    # lifecycle identity and reject stale finish/preemption of a reused id.
+    # DSA process-incarnation-aware request key. Carried so workers/connectors
+    # can reject stale finish/preemption of a reused request ID.
     # None when DSA threshold routing is disabled.
-    dsa_request_key: str | None = None
+    dsa_request_key: RequestKey | None = None
 
     @classmethod
     def from_request(
@@ -56,9 +67,9 @@ class NewRequestData:
         prefill_token_ids: list[int] | None = None,
     ) -> "NewRequestData":
         dsa_state = getattr(request, "dsa_state", None)
-        dsa_request_key: str | None = None
+        dsa_request_key: RequestKey | None = None
         if dsa_state is not None:
-            dsa_request_key = str(dsa_state.request_key)
+            dsa_request_key = dsa_state.request_key
         return cls(
             req_id=request.request_id,
             prompt_token_ids=request.prompt_token_ids,
@@ -133,9 +144,9 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
-    # DSA request key strings (req_id -> str(RequestKey)) for the cached
-    # requests in this step.  Empty when DSA threshold routing is disabled.
-    dsa_request_keys: dict[str, str] | None = None
+    # DSA request keys for the cached requests in this step. Empty when DSA
+    # threshold routing is disabled.
+    dsa_request_keys: dict[str, RequestKey] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -257,7 +268,7 @@ class SchedulerOutput:
     # immutable snapshots and MUST NOT re-derive sparse mode from prompt_len.
     # See vllm.v1.core.sched.dsa_types.DSARouteSnapshot.  Empty when threshold
     # routing is disabled (threshold == 0).
-    dsa_routes: dict[str, object] | None = None
+    dsa_routes: dict[str, DSARouteSnapshot] = field(default_factory=dict)
 
     # DSA capability fingerprints.  ``data_compatibility_fingerprint`` must be
     # identical across all PD participants; ``instance_capability_digest`` only
@@ -266,12 +277,15 @@ class SchedulerOutput:
     dsa_instance_capability_digest: str | None = None
 
     # DSA typed connector-only import commands (PD Decode dense bootstrap).
-    # None / empty when no connector-only import is scheduled this step.
-    dsa_connector_only_imports: tuple[object, ...] | None = None
+    # Empty when no connector-only import is scheduled this step.
+    dsa_connector_only_imports: tuple[DSAConnectorOnlyImport, ...] = ()
 
     # DSA typed preemption actions replacing bare request-id preemption.
-    # None / empty when no DSA preemption quiesce is scheduled this step.
-    dsa_preemption_actions: tuple[object, ...] | None = None
+    # Empty when no DSA preemption quiesce is scheduled this step.
+    dsa_preemption_actions: tuple[DSAPreemptionAction, ...] = ()
+
+    # DSA operation commands issued to workers/connectors in this step.
+    dsa_commands: tuple[DSAOperationCommand, ...] = ()
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

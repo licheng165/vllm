@@ -21,6 +21,7 @@ from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+    from vllm.v1.core.sched.dsa_types import DSAControlEvent, DSAOperationReceipt
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
 logger = init_logger(__name__)
@@ -91,6 +92,8 @@ class KVOutputAggregator:
         combined_kv_cache_events = None
         invalid_block_ids = set[int]()
         completed_decode_window_saves: dict[str, int] = {}
+        dsa_receipts: list[DSAOperationReceipt] = []
+        dsa_events: list[DSAControlEvent] = []
         for model_runner_output in outputs:
             assert model_runner_output is not None
             kv_output = model_runner_output.kv_connector_output
@@ -161,11 +164,26 @@ class KVOutputAggregator:
                     completed_decode_window_saves.get(req_id, 0),
                     window_end,
                 )
+            dsa_receipts.extend(kv_output.dsa_receipts)
+            dsa_events.extend(kv_output.dsa_events)
 
         # select output of the worker specified by output_rank
         output = outputs[output_rank]
 
         assert output is not None
+        execution_receipts = output.dsa_execution_receipts
+        if execution_receipts or any(
+            worker_output.dsa_execution_receipts
+            for worker_output in outputs
+            if worker_output is not None
+        ):
+            for worker_rank, worker_output in enumerate(outputs):
+                assert worker_output is not None
+                if worker_output.dsa_execution_receipts != execution_receipts:
+                    raise RuntimeError(
+                        "DSA execution receipts differ across worker ranks: "
+                        f"output_rank={output_rank}, worker_rank={worker_rank}"
+                    )
         output.kv_connector_output = KVConnectorOutput(
             finished_sending=finished_sending or None,
             finished_recving=finished_recving or None,
@@ -175,6 +193,8 @@ class KVOutputAggregator:
             invalid_block_ids=invalid_block_ids,
             completed_decode_window_saves=completed_decode_window_saves,
             expected_finished_count=self._expected_finished_count,
+            dsa_receipts=tuple(dsa_receipts),
+            dsa_events=tuple(dsa_events),
         )
 
         return output

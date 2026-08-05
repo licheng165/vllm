@@ -41,7 +41,13 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.sched.dsa_controller import DSAController, DSAControllerConfig
-from vllm.v1.core.sched.dsa_types import DSARouteState, RequestKey
+from vllm.v1.core.sched.dsa_operation_registry import DSAOperationError
+from vllm.v1.core.sched.dsa_types import (
+    DSALatentReleasePlan,
+    DSARouteState,
+    ParticipantIdentity,
+    RequestKey,
+)
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -487,6 +493,66 @@ class Scheduler(SchedulerInterface):
                 if isinstance(dsa_cfg, dict)
                 else "standalone",
             )
+        if self.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "positive-threshold DSA does not support pipeline parallelism"
+            )
+        if bool(
+            getattr(
+                getattr(self, "scheduler_config", None),
+                "async_scheduling",
+                False,
+            )
+        ):
+            raise ValueError(
+                "positive-threshold DSA does not support async scheduling"
+            )
+
+        tp_size = int(self.parallel_config.tensor_parallel_size)
+        dp_rank = int(self.parallel_config.data_parallel_rank)
+        engine_id = str(dsa_cfg.get("engine_id", "engine"))
+        configured_process_ids = dsa_cfg.get("participant_process_instance_ids")
+        if configured_process_ids is not None and (
+            not isinstance(configured_process_ids, (list, tuple))
+            or len(configured_process_ids) != tp_size
+        ):
+            raise ValueError(
+                "DSA participant_process_instance_ids must contain one entry "
+                "per tensor-parallel rank"
+            )
+        participants = tuple(
+            ParticipantIdentity(
+                engine_id=engine_id,
+                process_instance_id=(
+                    str(configured_process_ids[tp_rank])
+                    if configured_process_ids is not None
+                    else f"{engine_id}-dp{dp_rank}-tp{tp_rank}"
+                ),
+                worker_rank=tp_rank,
+                dp_rank=dp_rank,
+                pp_rank=0,
+                tp_rank=tp_rank,
+            )
+            for tp_rank in range(tp_size)
+        )
+        kv_groups = tuple(int(group) for group in dsa_cfg.get("kv_groups", (0,)))
+        if any(
+            group >= len(self.kv_cache_config.kv_cache_groups)
+            for group in kv_groups
+        ):
+            raise ValueError("DSA kv_groups references an unknown KV cache group")
+        configured_layers = dsa_cfg.get("required_layers")
+        if configured_layers is None:
+            num_required_layers = max(
+                (
+                    len(self.kv_cache_config.kv_cache_groups[group].layer_names)
+                    for group in kv_groups
+                ),
+                default=0,
+            )
+            required_layers = tuple(range(max(num_required_layers, 1)))
+        else:
+            required_layers = tuple(int(layer) for layer in configured_layers)
         return DSAControllerConfig(
             threshold=int(dsa_cfg["threshold"]),
             max_model_len=int(dsa_cfg.get("max_model_len", self.max_model_len)),
@@ -504,12 +570,29 @@ class Scheduler(SchedulerInterface):
             instance_capability_digest=str(
                 dsa_cfg.get("instance_capability_digest", "")
             ),
+            participants=participants,
+            required_layers=required_layers,
+            kv_groups=kv_groups,
+            operation_timeout_ms=int(dsa_cfg.get("operation_timeout_ms", 30_000)),
         )
 
     def _attach_dsa_route_snapshots(
         self, scheduler_output: SchedulerOutput
     ) -> None:
         """Attach authoritative DSA routes before connector metadata is built."""
+        pending_commands = self.dsa_controller.take_pending_commands()
+        if pending_commands:
+            scheduler_output.dsa_commands = (
+                *scheduler_output.dsa_commands,
+                *pending_commands,
+            )
+            scheduler_output.dsa_data_compatibility_fingerprint = (
+                self.dsa_controller.config.data_compatibility_fingerprint
+                or None
+            )
+            scheduler_output.dsa_instance_capability_digest = (
+                self.dsa_controller.config.instance_capability_digest or None
+            )
         scheduled_ids = list(scheduler_output.num_scheduled_tokens)
         if not scheduled_ids:
             return
@@ -537,8 +620,28 @@ class Scheduler(SchedulerInterface):
             for req_id in scheduled_ids
             if req_id in self.requests
         }
+        token_prefix_digests = {
+            req_id: self.dsa_controller.compute_token_prefix_digest(
+                list(self.requests[req_id].all_token_ids),
+                accepted_ends[req_id],
+            )
+            for req_id in scheduled_ids
+            if req_id in accepted_ends
+        }
+        if not self.dsa_controller.config.enabled:
+            for req_id, accepted_end in accepted_ends.items():
+                self.dsa_controller.consume_accepted_end(
+                    req_id,
+                    accepted_end,
+                    token_prefix_digests[req_id],
+                )
+        execution_seq = self.dsa_controller.next_execution_seq()
         snapshots = self.dsa_controller.build_route_snapshots(
-            scheduled_ids, accepted_ends
+            scheduled_ids,
+            accepted_ends,
+            scheduled_token_counts=scheduler_output.num_scheduled_tokens,
+            execution_seq=execution_seq,
+            token_prefix_digests=token_prefix_digests,
         )
         if not snapshots:
             return
@@ -590,6 +693,12 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            # Store commands run alongside resident forwards. Only the source
+            # activation barrier blocks this request from model execution.
+            if self.dsa_controller.blocks_model_execution(request.request_id):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -837,6 +946,15 @@ class Scheduler(SchedulerInterface):
 
                         request.num_external_computed_tokens = ext_tokens
                         num_external_computed_tokens = ext_tokens
+                        if self.dsa_controller.requires_import_frontier_receipt(
+                            request_id,
+                            num_external_computed_tokens,
+                        ):
+                            raise DSAOperationError(
+                                "positive-threshold DSA PD import is disabled "
+                                "until connector-only import frontier receipts "
+                                "are implemented"
+                            )
 
                         connector_prefix_cache_queries = (
                             request.num_tokens - num_new_local_computed_tokens
@@ -1168,10 +1286,15 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
-        # Begin a typed DSA preemption quiesce before freeing blocks.  The
-        # first version uses vLLM's full-recompute preemption semantics, so we
-        # retire the old RequestKey; the request gets a fresh key when it is
-        # re-admitted (design section 15.4).
+        if self.dsa_controller.blocks_model_execution(request.request_id):
+            raise DSAOperationError(
+                "cannot preempt a request during DSA source activation"
+            )
+        if self.dsa_controller.requires_preemption_quiesce(request.request_id):
+            raise DSAOperationError(
+                "positive-threshold DSA preemption is disabled until all-rank "
+                "preemption-quiesce receipts are implemented"
+            )
         self.dsa_controller.begin_preemption(request.request_id)
         self._dsa_pending_decode_window_releases.pop(request.request_id, None)
         self.kv_cache_manager.free(request)
@@ -1278,6 +1401,7 @@ class Scheduler(SchedulerInterface):
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
+        dsa_request_keys: dict[str, RequestKey] = {}
         resumed_req_ids = set()
 
         num_running_reqs = len(running_reqs)
@@ -1313,6 +1437,9 @@ class Scheduler(SchedulerInterface):
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
             )
+            dsa_state = getattr(req, "dsa_state", None)
+            if dsa_state is not None:
+                dsa_request_keys[req_id] = dsa_state.request_key
 
         return CachedRequestData(
             req_ids=req_ids,
@@ -1322,6 +1449,7 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            dsa_request_keys=dsa_request_keys or None,
         )
 
     def _try_schedule_encoder_inputs(
@@ -1524,6 +1652,25 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        dsa_execution_receipts = model_runner_output.dsa_execution_receipts
+        if self.dsa_controller.config.enabled:
+            expected_execution_receipts = set(num_scheduled_tokens)
+            actual_execution_receipts = set(dsa_execution_receipts)
+            if actual_execution_receipts != expected_execution_receipts:
+                missing = sorted(
+                    expected_execution_receipts - actual_execution_receipts
+                )
+                unexpected = sorted(
+                    actual_execution_receipts - expected_execution_receipts
+                )
+                raise DSAOperationError(
+                    "DSA execution receipt set mismatch: "
+                    f"missing={missing}, unexpected={unexpected}"
+                )
+            if set(scheduler_output.dsa_routes) != expected_execution_receipts:
+                raise DSAOperationError(
+                    "positive-threshold model batch is missing DSA route snapshots"
+                )
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1667,6 +1814,16 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            # C/E belongs to the completed snapshot. Consume it only after
+            # speculative rejection correction and accepted-token append, but
+            # before any stopped request can free its blocks. A is consumed in
+            # a separate call so draft placeholders can never trigger crossing.
+            if self.dsa_controller.config.enabled:
+                self._consume_dsa_execution_receipt(
+                    model_runner_output,
+                    request,
+                )
+
             if deep_transition_before is not None:
                 frontier_before, computed_before = deep_transition_before
                 frontier_after = int(request.num_tokens)
@@ -1803,6 +1960,15 @@ class Scheduler(SchedulerInterface):
                     )
                 )
 
+        if kv_connector_output:
+            self._consume_dsa_connector_output(kv_connector_output)
+
+        # Execution and connector receipts may each make a store or activation
+        # newly eligible. Finished requests are deliberately excluded.
+        for request in tuple(self.requests.values()):
+            if not request.is_finished():
+                self.dsa_controller.maybe_advance(request.request_id)
+
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(
@@ -1861,6 +2027,77 @@ class Scheduler(SchedulerInterface):
             eco.scheduler_stats = stats
 
         return engine_core_outputs
+
+    def _consume_dsa_execution_receipt(
+        self,
+        model_runner_output: ModelRunnerOutput,
+        request: Request,
+    ) -> None:
+        receipt = model_runner_output.dsa_execution_receipts.get(request.request_id)
+        if receipt is None:
+            raise DSAOperationError(
+                f"missing DSA execution receipt for {request.request_id}"
+            )
+        accepted_digest = self.dsa_controller.compute_token_prefix_digest(
+            list(request.all_token_ids),
+            request.num_tokens,
+        )
+        self.dsa_controller.consume_accepted_end(
+            request.request_id,
+            request.num_tokens,
+            accepted_digest,
+        )
+        completed_digest = self.dsa_controller.compute_token_prefix_digest(
+            list(request.all_token_ids),
+            receipt.completed_canonical_end,
+        )
+        self.dsa_controller.consume_completed_execution(
+            request.request_id,
+            receipt,
+            completed_digest,
+        )
+
+    def _consume_dsa_connector_output(
+        self, kv_connector_output: KVConnectorOutput
+    ) -> None:
+        for event in kv_connector_output.dsa_events:
+            if event.kind != "source_revoked":
+                raise DSAOperationError(
+                    "workers may only emit unsolicited DSA source revocation "
+                    f"events, got {event.kind!r}"
+                )
+        for event in kv_connector_output.dsa_events:
+            self.dsa_controller.consume_event(
+                event.request_key.request_id,
+                event,
+            )
+        for receipt in kv_connector_output.dsa_receipts:
+            release_plan = self.dsa_controller.consume_operation_receipt(receipt)
+            if release_plan is not None:
+                self._commit_dsa_release_plan(release_plan)
+
+    def _commit_dsa_release_plan(self, plan: DSALatentReleasePlan) -> None:
+        request = self.requests.get(plan.request_key.request_id)
+        if (
+            request is None
+            or request.is_finished()
+            or getattr(request, "dsa_state", None) is None
+            or request.dsa_state.request_key != plan.request_key
+        ):
+            raise DSAOperationError("DSA release plan targets a stale request")
+
+        self.dsa_controller.validate_release_plan(plan)
+        transaction = self.kv_cache_manager.prepare_dsa_release(
+            request_key=plan.request_key,
+            proposed_end=plan.release_end,
+            source_generation_id=plan.source_generation_id,
+            request=request,
+        )
+        committed_release_end = transaction.commit_no_fail(self.kv_cache_manager)
+        self.dsa_controller.commit_release_plan(
+            plan,
+            committed_release_end,
+        )
 
     @staticmethod
     def _is_blocked_waiting_status(status: RequestStatus) -> bool:
@@ -1947,11 +2184,6 @@ class Scheduler(SchedulerInterface):
             if stopped:
                 del new_token_ids[num_new:]  # Trim new tokens if needed.
                 break
-        if self.dsa_controller.config.enabled:
-            self.dsa_controller.consume_accepted_end(
-                request.request_id,
-                request.num_tokens,
-            )
         return new_token_ids, stopped
 
     def _free_encoder_inputs(self, request: Request) -> None:
@@ -2539,6 +2771,19 @@ class Scheduler(SchedulerInterface):
 
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
+
+        if self.dsa_controller.config.enabled:
+            if kv_connector_output.completed_decode_window_saves:
+                logger.warning(
+                    "Ignoring legacy decode-window completion frontiers while "
+                    "positive-threshold DSA requires registered exact receipts"
+                )
+            kv_connector_output.completed_decode_window_saves.clear()
+            pending_dsa_releases = getattr(
+                self, "_dsa_pending_decode_window_releases", None
+            )
+            if pending_dsa_releases is not None:
+                pending_dsa_releases.clear()
 
         if blocked_release_req_ids:
             for req_id in blocked_release_req_ids:

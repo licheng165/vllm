@@ -27,7 +27,12 @@ from vllm.v1.core.encoder_cache_manager import EncoderCacheManager
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched import scheduler as scheduler_module
 from vllm.v1.core.sched.dsa_controller import DSAController, DSAControllerConfig
-from vllm.v1.core.sched.dsa_types import DSARouteState
+from vllm.v1.core.sched.dsa_operation_registry import DSAOperationError
+from vllm.v1.core.sched.dsa_types import (
+    DSAExecutionReceipt,
+    DSARouteState,
+    RequestKey,
+)
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
@@ -80,6 +85,7 @@ def test_scheduler_output_carries_dsa_lifecycle_identity() -> None:
         request_id="long-request",
         resumable=False,
         num_tokens=128,
+        all_token_ids=list(range(128)),
         dsa_state=None,
     )
     scheduler.add_request(request)
@@ -96,6 +102,240 @@ def test_scheduler_output_carries_dsa_lifecycle_identity() -> None:
     route = scheduler_output.dsa_routes[request.request_id]
     assert route.request_key == request.dsa_state.request_key
     assert route.route_state == DSARouteState.PROMOTING
+
+
+@pytest.mark.skip_global_cleanup
+def test_command_only_scheduler_output_drains_registered_dsa_command() -> None:
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.requests = {}
+    scheduler.dsa_controller = DSAController(
+        config=DSAControllerConfig(
+            threshold=64,
+            max_model_len=1024,
+            block_size=16,
+            chunk_size=16,
+            window_size=16,
+            index_topk=16,
+            query_width=2,
+            scratch_capacity=32,
+            node_role="standalone",
+            deployment_mode="standalone",
+            data_compatibility_fingerprint="data-fingerprint",
+            instance_capability_digest="instance-digest",
+        ),
+        process_instance_id="scheduler-process",
+    )
+    state = scheduler.dsa_controller.initialize_state("request", 64)
+    scheduler.dsa_controller.attach_state(state)
+    state.completed_canonical_end = 64
+    state.initial_prefill_complete = True
+    state.min_position_of_next_target_rows = 64
+    state.token_prefix_digest = "token-digest"
+    scheduler.dsa_controller.maybe_advance("request")
+
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler._attach_dsa_route_snapshots(scheduler_output)
+
+    assert scheduler_output.total_num_scheduled_tokens == 0
+    assert len(scheduler_output.dsa_commands) == 1
+    assert (
+        scheduler_output.dsa_data_compatibility_fingerprint
+        == "data-fingerprint"
+    )
+    assert scheduler_output.dsa_instance_capability_digest == "instance-digest"
+    command = scheduler_output.dsa_commands[0]
+    assert (
+        state.request_key,
+        command.operation.operation_id,
+    ) in scheduler.dsa_controller.operations.records
+    assert scheduler.dsa_controller.take_pending_commands() == ()
+
+
+@pytest.mark.skip_global_cleanup
+def test_cached_request_data_uses_actual_dsa_request_keys() -> None:
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.use_pp = False
+    scheduler.prev_step_scheduled_req_ids = {"request"}
+    request_key = RequestKey("scheduler", "request", 1)
+    request = SimpleNamespace(
+        request_id="request",
+        num_computed_tokens=7,
+        num_output_tokens=2,
+        num_output_placeholders=0,
+        all_token_ids=[1, 2, 3],
+        dsa_state=SimpleNamespace(request_key=request_key),
+    )
+    blocks = SimpleNamespace(get_block_ids=Mock(return_value=None))
+
+    cached = scheduler._make_cached_request_data(
+        [request],
+        [],
+        {"request": 1},
+        {},
+        {"request": blocks},
+    )
+
+    assert cached.dsa_request_keys == {"request": request_key}
+
+
+@pytest.mark.skip_global_cleanup
+def test_scheduler_derives_exact_tp_participants_for_dsa_commands() -> None:
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = 16
+    scheduler.max_model_len = 1024
+    scheduler.vllm_config = SimpleNamespace(
+        additional_config={
+            "dsa": {
+                "threshold": 64,
+                "chunk_size": 16,
+                "scratch_capacity": 32,
+                "data_compatibility_fingerprint": "fingerprint",
+            }
+        }
+    )
+    scheduler.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=1,
+        tensor_parallel_size=2,
+        data_parallel_rank=3,
+    )
+    scheduler.scheduler_config = SimpleNamespace(async_scheduling=False)
+    scheduler.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=["layer-0", "layer-1"])]
+    )
+
+    config = scheduler._build_dsa_controller_config()
+
+    assert len(config.receipt_participants) == 2
+    assert tuple(
+        (participant.dp_rank, participant.pp_rank, participant.tp_rank)
+        for participant in config.receipt_participants
+    ) == ((3, 0, 0), (3, 0, 1))
+    assert config.required_layers == (0, 1)
+
+
+@pytest.mark.skip_global_cleanup
+def test_positive_threshold_pipeline_parallelism_fails_closed() -> None:
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.block_size = 16
+    scheduler.max_model_len = 1024
+    scheduler.vllm_config = SimpleNamespace(
+        additional_config={
+            "dsa": {
+                "threshold": 64,
+                "chunk_size": 16,
+                "scratch_capacity": 32,
+                "data_compatibility_fingerprint": "fingerprint",
+            }
+        }
+    )
+    scheduler.parallel_config = SimpleNamespace(
+        pipeline_parallel_size=2,
+        tensor_parallel_size=1,
+        data_parallel_rank=0,
+    )
+    scheduler.scheduler_config = SimpleNamespace(async_scheduling=False)
+    scheduler.kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=["layer-0"])]
+    )
+
+    with pytest.raises(ValueError, match="pipeline parallelism"):
+        scheduler._build_dsa_controller_config()
+
+
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    "execution_receipts",
+    [{}, {"unexpected": object()}],
+)
+def test_positive_threshold_model_batch_requires_exact_execution_receipt_set(
+    execution_receipts: dict[str, object],
+) -> None:
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.dsa_controller = SimpleNamespace(
+        config=SimpleNamespace(enabled=True)
+    )
+    scheduler_output = SchedulerOutput.make_empty()
+    scheduler_output.num_scheduled_tokens = {"request": 1}
+    scheduler_output.total_num_scheduled_tokens = 1
+    scheduler_output.dsa_routes = {"request": object()}
+    model_output = ModelRunnerOutput(
+        req_ids=["request"],
+        req_id_to_index={"request": 0},
+        dsa_execution_receipts=execution_receipts,
+    )
+
+    with pytest.raises(DSAOperationError, match="receipt set mismatch"):
+        scheduler.update_from_output(scheduler_output, model_output)
+
+
+@pytest.mark.skip_global_cleanup
+def test_scheduler_consumes_shared_execution_receipt() -> None:
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.dsa_controller = DSAController(
+        config=DSAControllerConfig(
+            threshold=64,
+            max_model_len=1024,
+            block_size=16,
+            chunk_size=16,
+            window_size=16,
+            index_topk=16,
+            query_width=2,
+            scratch_capacity=32,
+            node_role="standalone",
+            deployment_mode="standalone",
+            data_compatibility_fingerprint="fingerprint",
+            instance_capability_digest="instance-digest",
+        ),
+        process_instance_id="scheduler-process",
+    )
+    request = SimpleNamespace(
+        request_id="request",
+        num_tokens=5,
+        all_token_ids=[1, 2, 3, 4, 5],
+    )
+    state = scheduler.dsa_controller.initialize_state("request", 5)
+    scheduler.dsa_controller.attach_state(state)
+    state.completed_canonical_end = 4
+    state.external_computed_end = 3
+    state.min_position_of_next_target_rows = 4
+    digest = scheduler.dsa_controller.compute_token_prefix_digest(
+        request.all_token_ids,
+        request.num_tokens,
+    )
+    sequence = scheduler.dsa_controller.next_execution_seq()
+    scheduler.dsa_controller.build_route_snapshots(
+        ["request"],
+        {"request": 5},
+        scheduled_token_counts={"request": 1},
+        execution_seq=sequence,
+        token_prefix_digests={"request": digest},
+    )
+    request.all_token_ids.append(6)
+    request.num_tokens = 6
+    model_output = ModelRunnerOutput(
+        req_ids=["request"],
+        req_id_to_index={"request": 0},
+        dsa_execution_receipts={
+            "request": DSAExecutionReceipt(
+                request_key=state.request_key,
+                execution_seq=sequence,
+                route_epoch=state.route_epoch,
+                accepted_end_at_execution=5,
+                completed_canonical_end=5,
+                external_computed_end=4,
+                initial_prefill_complete=True,
+                min_position_of_next_target_rows=5,
+                token_prefix_digest=digest,
+            )
+        },
+    )
+
+    scheduler._consume_dsa_execution_receipt(model_output, request)
+
+    assert state.accepted_end == 6
+    assert state.completed_canonical_end == 5
+    assert state.external_computed_end == 4
+    assert state.initial_prefill_complete is True
 
 
 def test_finish_request():
@@ -292,7 +532,7 @@ def test_deep_finish_and_completed_window_state(
 
 
 @pytest.mark.skip_global_cleanup
-def test_positive_threshold_release_requires_active_sparse_source() -> None:
+def test_positive_threshold_rejects_legacy_window_release_frontier() -> None:
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.connector = None
     scheduler.dsa_controller = SimpleNamespace(
@@ -327,65 +567,8 @@ def test_positive_threshold_release_requires_active_sparse_source() -> None:
 
     remove_saved_blocks.assert_not_called()
     assert dsa_state.route_state == DSARouteState.RESIDENT
-    pending_key, pending_frontiers = (
-        scheduler._dsa_pending_decode_window_releases[request_id]
-    )
-    assert pending_key is dsa_state.request_key
-    assert list(pending_frontiers) == [256]
-
-    dsa_state.route_state = DSARouteState.SPARSE
-    dsa_state.active_source_generation_id = "generation-1"
-    dsa_state.active_source_receipt_bundle_id = "receipt-1"
-    dsa_state.initial_prefill_complete = True
-    dsa_state.remap_end = 256
-    scheduler._update_from_kv_xfer_finished(
-        KVConnectorOutput(completed_decode_window_saves={})
-    )
-
-    remove_saved_blocks.assert_called_once_with(
-        request_id,
-        256,
-    )
-    assert dsa_state.release_end == 256
     assert scheduler._dsa_pending_decode_window_releases == {}
-
-    dsa_state.route_state = DSARouteState.PROMOTING
-    for release_end in (512, 768):
-        scheduler._update_from_kv_xfer_finished(
-            KVConnectorOutput(
-                completed_decode_window_saves={request_id: release_end}
-            )
-        )
-    _, pending_frontiers = scheduler._dsa_pending_decode_window_releases[
-        request_id
-    ]
-    assert list(pending_frontiers) == [512, 768]
-
-    dsa_state.route_state = DSARouteState.SPARSE
-    dsa_state.remap_end = 512
-    scheduler._update_from_kv_xfer_finished(
-        KVConnectorOutput(completed_decode_window_saves={})
-    )
-
-    assert remove_saved_blocks.call_count == 2
-    remove_saved_blocks.assert_called_with(request_id, 512)
-    assert dsa_state.release_end == 512
-    _, pending_frontiers = scheduler._dsa_pending_decode_window_releases[
-        request_id
-    ]
-    assert list(pending_frontiers) == [768]
-
-    invalidated_output = KVConnectorOutput(
-        completed_decode_window_saves={request_id: 1024}
-    )
-    scheduler._update_from_kv_xfer_finished(
-        invalidated_output,
-        blocked_release_req_ids={request_id},
-    )
-
-    assert remove_saved_blocks.call_count == 2
-    assert invalidated_output.completed_decode_window_saves == {}
-    assert scheduler._dsa_pending_decode_window_releases == {}
+    assert completed.completed_decode_window_saves == {}
 
 
 def test_deep_gates_use_configured_first_window(

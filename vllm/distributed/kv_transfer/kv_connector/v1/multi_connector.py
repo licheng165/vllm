@@ -34,6 +34,11 @@ if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVCacheEvent
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.sched.dsa_types import (
+        DSAControlEvent,
+        DSAOperationReceipt,
+        DSASourceLease,
+    )
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -319,6 +324,30 @@ class MultiConnector(KVConnectorBase_V1):
             for req_id, window_end in get_completed().items():
                 completed[req_id] = max(completed.get(req_id, 0), window_end)
         return completed
+
+    def get_dsa_operation_receipts(self) -> Iterable["DSAOperationReceipt"]:
+        """Drain DSA operation receipts from every child connector."""
+        return tuple(
+            receipt
+            for connector in self._connectors
+            for receipt in connector.get_dsa_operation_receipts()
+        )
+
+    def get_dsa_control_events(self) -> Iterable["DSAControlEvent"]:
+        """Drain DSA control events from every child connector."""
+        return tuple(
+            event
+            for connector in self._connectors
+            for event in connector.get_dsa_control_events()
+        )
+
+    def get_released_dsa_source_leases(self) -> Iterable["DSASourceLease"]:
+        """Drain source-lease release proofs from every child connector."""
+        return tuple(
+            lease
+            for connector in self._connectors
+            for lease in connector.get_released_dsa_source_leases()
+        )
 
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Set xPU-specific copy ops for all sub-connectors."""

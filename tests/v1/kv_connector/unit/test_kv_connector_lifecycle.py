@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from contextlib import nullcontext
-from unittest.mock import patch
+from unittest.mock import patch, sentinel
 
 import pytest
 
@@ -15,6 +15,7 @@ from vllm.distributed.kv_transfer.kv_transfer_state import (
 )
 from vllm.forward_context import set_forward_context
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 
 # Importing utils registers TestExampleConnector with the factory
@@ -34,6 +35,21 @@ def _make_empty_scheduler_output():
         free_encoder_mm_hashes=[],
         kv_connector_metadata=ExampleConnectorMetadata(),
     )
+
+
+@pytest.fixture
+def dsa_connector():
+    vllm_config = create_vllm_config()
+    vllm_config.kv_transfer_config.kv_connector = "TestExampleConnector"
+    vllm_config.kv_transfer_config.kv_role = "kv_both"
+    vllm_config.kv_transfer_config.kv_connector_extra_config["name"] = "dsa"
+    ensure_kv_transfer_initialized(vllm_config)
+
+    try:
+        connector = get_kv_transfer_group()
+        yield vllm_config, connector._connector
+    finally:
+        KVConnectorModelRunnerMixin.ensure_kv_transfer_shutdown()
 
 
 def test_kv_connector_mixin_clears_metadata():
@@ -129,3 +145,129 @@ def test_kv_connector_finalize_clears_metadata_on_failure():
         assert connector.call_record.get("clear_connector_metadata", 0) == 1
     finally:
         KVConnectorModelRunnerMixin.ensure_kv_transfer_shutdown()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_kv_connector_mixin_drains_dsa_output_after_save(dsa_connector):
+    vllm_config, connector = dsa_connector
+    calls = []
+
+    def wait_for_save():
+        calls.append("wait_for_save")
+
+    def get_receipts():
+        calls.append("get_receipts")
+        return [sentinel.receipt]
+
+    def get_events():
+        calls.append("get_events")
+        return iter((sentinel.event,))
+
+    with (
+        patch.object(connector, "wait_for_save", side_effect=wait_for_save),
+        patch.object(
+            connector,
+            "get_dsa_operation_receipts",
+            side_effect=get_receipts,
+        ),
+        patch.object(
+            connector,
+            "get_dsa_control_events",
+            side_effect=get_events,
+        ),
+        set_forward_context(None, vllm_config),
+        KVConnectorModelRunnerMixin._get_kv_connector_output(
+            _make_empty_scheduler_output()
+        ) as output,
+    ):
+        pass
+
+    assert calls == ["wait_for_save", "get_receipts", "get_events"]
+    assert output.dsa_receipts == (sentinel.receipt,)
+    assert output.dsa_events == (sentinel.event,)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_kv_connector_no_forward_preserves_dsa_only_output(dsa_connector):
+    vllm_config, connector = dsa_connector
+
+    with patch.object(
+        connector,
+        "get_dsa_operation_receipts",
+        return_value=[sentinel.receipt],
+    ):
+        output = KVConnectorModelRunnerMixin.kv_connector_no_forward(
+            _make_empty_scheduler_output(), vllm_config
+        )
+
+    assert output is not EMPTY_MODEL_RUNNER_OUTPUT
+    assert output.kv_connector_output is not None
+    assert output.kv_connector_output.dsa_receipts == (sentinel.receipt,)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_kv_connector_deferred_finalize_preserves_dsa_output(dsa_connector):
+    vllm_config, connector = dsa_connector
+    calls = []
+
+    def wait_for_save():
+        calls.append("wait_for_save")
+
+    def get_receipts():
+        calls.append("get_receipts")
+        return [sentinel.receipt]
+
+    def get_events():
+        calls.append("get_events")
+        return [sentinel.event]
+
+    with (
+        patch.object(connector, "wait_for_save", side_effect=wait_for_save),
+        patch.object(
+            connector,
+            "get_dsa_operation_receipts",
+            side_effect=get_receipts,
+        ),
+        patch.object(
+            connector,
+            "get_dsa_control_events",
+            side_effect=get_events,
+        ),
+        patch.object(
+            connector,
+            "get_completed_decode_window_saves",
+            side_effect=(
+                {"early": 128, "same": 512},
+                {"late": 256, "same": 256},
+            ),
+            create=True,
+        ),
+        set_forward_context(None, vllm_config),
+    ):
+        with KVConnectorModelRunnerMixin._get_kv_connector_output(
+            _make_empty_scheduler_output(), defer_finalize=True
+        ) as output:
+            pass
+        finalized_output = KVConnectorModelRunnerMixin.finalize_kv_connector(output)
+
+    assert finalized_output is output
+    assert calls == [
+        "get_receipts",
+        "get_events",
+        "wait_for_save",
+        "get_receipts",
+        "get_events",
+    ]
+    assert finalized_output.dsa_receipts == (
+        sentinel.receipt,
+        sentinel.receipt,
+    )
+    assert finalized_output.dsa_events == (sentinel.event, sentinel.event)
+    assert finalized_output.completed_decode_window_saves == {
+        "early": 128,
+        "same": 512,
+        "late": 256,
+    }
