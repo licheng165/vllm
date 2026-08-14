@@ -10,6 +10,7 @@ from typing import Any, cast
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
     STREAM_FINISHED,
@@ -37,6 +38,8 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+
+logger = init_logger(__name__)
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -772,6 +775,29 @@ class OutputProcessor:
 
         assert engine_core_timestamp is not None
         assert req_state.stats is not None
+        if req_state.is_prefilling:
+            prompt_tokens = req_state.prompt_len
+            cached_tokens = engine_core_output.num_cached_tokens
+            external_tokens = engine_core_output.num_external_computed_tokens
+            recomputed_tokens = int(cached_tokens + 1 == prompt_tokens)
+            local_compute = prompt_tokens - cached_tokens
+            local_cache_hit = (
+                cached_tokens + recomputed_tokens - external_tokens
+            )
+            if local_compute < 0 or local_cache_hit < 0:
+                logger.error(
+                    "[PROMPT_TOKEN_ACCOUNTING_BAD] internal_req=%s "
+                    "external_req=%s prompt=%d cached=%d external=%d "
+                    "recomputed=%d local_compute=%d local_cache_hit=%d",
+                    engine_core_output.request_id,
+                    req_state.external_req_id,
+                    prompt_tokens,
+                    cached_tokens,
+                    external_tokens,
+                    recomputed_tokens,
+                    local_compute,
+                    local_cache_hit,
+                )
         iteration_stats.update_from_output(
             engine_core_output,
             engine_core_timestamp,

@@ -1117,10 +1117,31 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # Labeled prompt token counters by source
         pts = iteration_stats.prompt_token_stats
         for source in PromptTokenStats.ALL_SOURCES:
-            self.counter_prompt_tokens_by_source[source][engine_idx].inc(
-                pts.get_by_source(source)
+            value = pts.get_by_source(source)
+            if value < 0:
+                logger.error(
+                    "[NEGATIVE_PROMPT_METRIC] engine_idx=%s source=%s "
+                    "value=%s stats=%s; clamping increment to zero so "
+                    "AsyncLLM output processing can continue",
+                    engine_idx,
+                    source,
+                    value,
+                    pts,
+                )
+                value = 0
+            self.counter_prompt_tokens_by_source[source][engine_idx].inc(value)
+        cached_tokens = pts.cached_tokens
+        if cached_tokens < 0:
+            logger.error(
+                "[NEGATIVE_PROMPT_METRIC] engine_idx=%s source=cached_tokens "
+                "value=%s stats=%s; clamping increment to zero so AsyncLLM "
+                "output processing can continue",
+                engine_idx,
+                cached_tokens,
+                pts,
             )
-        self.counter_prompt_tokens_cached[engine_idx].inc(pts.cached_tokens)
+            cached_tokens = 0
+        self.counter_prompt_tokens_cached[engine_idx].inc(cached_tokens)
         self.counter_prompt_tokens_recomputed[engine_idx].inc(pts.recomputed_tokens)
         self.counter_generation_tokens[engine_idx].inc(
             iteration_stats.num_generation_tokens
