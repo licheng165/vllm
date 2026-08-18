@@ -1561,6 +1561,15 @@ class DeepseekV2ForCausalLM(
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # With a shared indexer (GLM-5.2 indexer_types) only some layers build
+        # an indexer, yet the checkpoint may still ship indexer weights for
+        # the omitted layers. Track the prefixes that actually instantiated an
+        # indexer so only those weights can be dropped; missing weights for a
+        # constructed (producer) indexer must still fail the loader gate.
+        indexer_present_prefixes = {
+            n.rsplit(".indexer.", 1)[0] for n in params_dict if ".indexer." in n
+        }
+        skipped_omitted_indexer_weights = 0
         skip_extra_layer_weights = getattr(
             self.config, "vllm_skip_extra_layer_weights", False
         )
@@ -1579,6 +1588,12 @@ class DeepseekV2ForCausalLM(
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+
+            if ".indexer." in name and (
+                name.rsplit(".indexer.", 1)[0] not in indexer_present_prefixes
+            ):
+                skipped_omitted_indexer_weights += 1
+                continue  # this layer has no indexer; drop its checkpoint weights
 
             is_fusion_moe_shared_experts_layer = (
                 rocm_aiter_moe_shared_expert_enabled and ("mlp.shared_experts" in name)
@@ -1737,6 +1752,24 @@ class DeepseekV2ForCausalLM(
                         weight_loader(param, loaded_weight)
             if name is not None and not is_fusion_moe_shared_experts_layer:
                 loaded_params.add(name)
+
+        if skipped_omitted_indexer_weights:
+            producer_indexer_layers = sorted(
+                {
+                    p.split(".layers.")[-1].split(".")[0]
+                    for p in indexer_present_prefixes
+                    if ".layers." in p
+                },
+                key=lambda s: int(s) if s.isdigit() else s,
+            )
+            logger.info(
+                "Dropped %d checkpoint indexer weights for layers without a "
+                "constructed indexer; %d layers kept their producer indexer "
+                "(layer ids: %s).",
+                skipped_omitted_indexer_weights,
+                len(producer_indexer_layers),
+                producer_indexer_layers,
+            )
 
         return loaded_params
 
