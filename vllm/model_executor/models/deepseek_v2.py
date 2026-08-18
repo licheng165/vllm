@@ -973,6 +973,10 @@ class DeepseekV2MLAAttention(nn.Module):
 
             _indexer_types = getattr(config, "indexer_types", None)
             _index_topk_pattern = getattr(config, "index_topk_pattern", None)
+            if _index_topk_pattern is not None and not isinstance(
+                _index_topk_pattern, (list, tuple)
+            ):
+                _index_topk_pattern = None
 
             if _indexer_types is not None:
                 # Checkpoint-level indexer sharing (GLM-5.2): "full" layers are
@@ -1024,8 +1028,12 @@ class DeepseekV2MLAAttention(nn.Module):
             elif _index_topk_pattern is None:
                 # Runtime IndexCache (e.g. GLM-5.1): compute sharing only, the
                 # checkpoint still ships indexer weights for every layer.
-                _index_topk_freq = getattr(config, "index_topk_freq", 1)
-                _index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
+                # NOTE: configs parsed from JSON may carry explicit nulls, so
+                # fall back to the documented defaults for missing values.
+                _index_topk_freq = getattr(config, "index_topk_freq", None) or 1
+                _index_skip_topk_offset = (
+                    getattr(config, "index_skip_topk_offset", None) or 2
+                )
                 _skip_topk = (
                     max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq
                     != 0
