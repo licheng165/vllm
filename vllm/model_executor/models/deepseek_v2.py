@@ -87,7 +87,11 @@ from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.attention.backends.mla.indexer import (
     DeepseekV32IndexerBackend,
 )
-from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import (
+    DSAKVRegistration,
+    KVCacheSpec,
+    MLAAttentionSpec,
+)
 
 from .interfaces import (
     MixtureOfExperts,
@@ -586,7 +590,12 @@ class DeepseekV2Attention(nn.Module):
 
 class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
     def __init__(
-        self, head_dim: int, dtype: torch.dtype, prefix: str, cache_config: CacheConfig
+        self,
+        head_dim: int,
+        dtype: torch.dtype,
+        prefix: str,
+        cache_config: CacheConfig,
+        dsa_kv_registration: DSAKVRegistration,
     ):
         super().__init__()
         self.kv_cache = [torch.tensor([])]
@@ -594,6 +603,7 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        self.dsa_kv_registration = dsa_kv_registration
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
@@ -605,6 +615,7 @@ class DeepseekV32IndexerCache(torch.nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            dsa_kv_registration=self.dsa_kv_registration,
         )
 
     def forward(self): ...
@@ -623,6 +634,7 @@ class Indexer(nn.Module):
         quant_config: QuantizationConfig | None,
         cache_config: CacheConfig | None,
         topk_indices_buffer: torch.Tensor | None,
+        dsa_kv_registration: DSAKVRegistration,
         prefix: str = "",
     ):
         super().__init__()
@@ -671,6 +683,7 @@ class Indexer(nn.Module):
             dtype=torch.uint8,
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
+            dsa_kv_registration=dsa_kv_registration,
         )
         self.max_model_len = vllm_config.model_config.max_model_len
         self.prefix = prefix
@@ -957,10 +970,18 @@ class DeepseekV2MLAAttention(nn.Module):
         _skip_topk = False
         _indexer_omitted = False
         is_mtp_layer = False
+        dsa_latent_registration = None
+        dsa_indexer_registration = None
         if self.is_v32:
             # Only parse the DSA layer id for v3.2-style models; other models
             # can contain multiple integers in their prefixes.
             layer_id = extract_layer_index(prefix)
+            dsa_latent_registration = DSAKVRegistration(
+                execution_ordinal=layer_id, kv_group=0
+            )
+            dsa_indexer_registration = DSAKVRegistration(
+                execution_ordinal=layer_id, kv_group=1
+            )
 
             _num_hidden_layers = getattr(config, "num_hidden_layers", None)
             # The skip pattern only governs backbone layers. MTP/nextn layers
@@ -1048,6 +1069,7 @@ class DeepseekV2MLAAttention(nn.Module):
         self.skip_topk = _skip_topk
 
         if self.is_v32 and not _indexer_omitted:
+            assert dsa_indexer_registration is not None
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 max_position=max_position_embeddings,
@@ -1062,6 +1084,7 @@ class DeepseekV2MLAAttention(nn.Module):
                 quant_config,
                 cache_config,
                 topk_indices_buffer,
+                dsa_indexer_registration,
                 f"{prefix}.indexer",
             )
         else:
@@ -1087,6 +1110,7 @@ class DeepseekV2MLAAttention(nn.Module):
             is_sparse=self.is_v32,
             topk_indices_buffer=topk_indices_buffer,
             skip_topk=self.skip_topk,
+            dsa_kv_registration=dsa_latent_registration,
         )
 
         self.mla_attn = MultiHeadLatentAttentionWrapper(
@@ -1103,6 +1127,9 @@ class DeepseekV2MLAAttention(nn.Module):
             quant_config,
             prefix,
         )
+        # OOT MLA wrappers may construct the final AttentionLayer themselves.
+        # Keep the model-provided identity on that authoritative module too.
+        self.mla_attn.mla_attn.dsa_kv_registration = dsa_latent_registration
 
     def forward(
         self,

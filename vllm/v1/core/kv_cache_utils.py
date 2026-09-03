@@ -4,10 +4,11 @@
 
 import copy
 import hashlib
+import json
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from functools import partial
 from math import lcm
 from typing import Any, NewType, TypeAlias, overload
@@ -20,6 +21,9 @@ from vllm.utils.math_utils import cdiv
 from vllm.utils.mem_utils import format_gib
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    DSAExecutionRow,
+    DSAKVRow,
+    DSAKVTopology,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -80,6 +84,173 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 
 logger = init_logger(__name__)
+
+_DSA_KV_TOPOLOGY_ABI_VERSION = 1
+
+
+def _canonical_signature_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_signature_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_signature_value(item) for item in value]
+    return str(value)
+
+
+def _dsa_spec_geometry(spec: KVCacheSpec) -> dict[str, Any]:
+    geometry = {
+        f.name: _canonical_signature_value(getattr(spec, f.name))
+        for f in fields(spec)
+        if f.name != "dsa_kv_registration"
+    }
+    geometry["page_size_bytes"] = spec.page_size_bytes
+    geometry["spec_type"] = f"{type(spec).__module__}.{type(spec).__qualname__}"
+    return geometry
+
+
+def build_dsa_kv_topology(
+    kv_cache_specs: dict[str, KVCacheSpec],
+) -> DSAKVTopology:
+    """Build and validate the canonical global topology from final KV specs."""
+    missing_registrations = sorted(
+        layer_name
+        for layer_name, spec in kv_cache_specs.items()
+        if spec.dsa_kv_registration is None
+    )
+    if missing_registrations:
+        raise ValueError(
+            "DSA KV topology has missing registrations for cache layers: "
+            f"{missing_registrations}."
+        )
+    if not kv_cache_specs:
+        raise ValueError("DSA KV topology has no registered cache layers.")
+
+    registered_layers: dict[tuple[int, int], str] = {}
+    layers_by_group: list[list[tuple[int, str]]] = [[], []]
+    for layer_name, spec in kv_cache_specs.items():
+        registration = spec.dsa_kv_registration
+        assert registration is not None
+        execution_ordinal = registration.execution_ordinal
+        kv_group = registration.kv_group
+        if execution_ordinal < 0:
+            raise ValueError(
+                "DSA KV topology execution ordinals must be non-negative, got "
+                f"{execution_ordinal} for {layer_name!r}."
+            )
+        if kv_group not in (0, 1):
+            raise ValueError(
+                "DSA KV topology only supports LATENT group 0 and INDEXER "
+                f"group 1, got group {kv_group} for {layer_name!r}."
+            )
+        registration_key = (execution_ordinal, kv_group)
+        duplicate = registered_layers.get(registration_key)
+        if duplicate is not None:
+            raise ValueError(
+                "DSA KV topology has duplicate registrations for execution "
+                f"{execution_ordinal} group {kv_group}: {duplicate!r} and "
+                f"{layer_name!r}."
+            )
+        registered_layers[registration_key] = layer_name
+        layers_by_group[kv_group].append((execution_ordinal, layer_name))
+
+    if not layers_by_group[0]:
+        raise ValueError("DSA KV topology is missing the LATENT group 0.")
+    if not layers_by_group[1]:
+        raise ValueError("DSA KV topology is missing the physical INDEXER group 1.")
+
+    latent_ordinals = sorted(ordinal for ordinal, _ in layers_by_group[0])
+    expected_latent_ordinals = list(range(len(latent_ordinals)))
+    if latent_ordinals != expected_latent_ordinals:
+        missing = sorted(set(expected_latent_ordinals) - set(latent_ordinals))
+        raise ValueError(
+            "DSA KV topology has missing LATENT executions; expected dense "
+            f"ordinals {expected_latent_ordinals}, got {latent_ordinals}, "
+            f"missing={missing}."
+        )
+
+    latent_executions = set(latent_ordinals)
+    orphan_indexers = sorted(
+        (ordinal, layer_name)
+        for ordinal, layer_name in layers_by_group[1]
+        if ordinal not in latent_executions
+    )
+    if orphan_indexers:
+        raise ValueError(
+            "DSA KV topology has orphan INDEXER registrations without a "
+            f"LATENT execution: {orphan_indexers}."
+        )
+
+    rows_by_group_list: list[tuple[DSAKVRow, ...]] = []
+    for kv_group, registered_group in enumerate(layers_by_group):
+        rows_by_group_list.append(
+            tuple(
+                DSAKVRow(
+                    layer_name=layer_name,
+                    execution_ordinal=execution_ordinal,
+                    kv_group=kv_group,
+                    row_ordinal=row_ordinal,
+                    bank=row_ordinal % 2,
+                )
+                for row_ordinal, (execution_ordinal, layer_name) in enumerate(
+                    sorted(registered_group)
+                )
+            )
+        )
+    rows_by_group = (rows_by_group_list[0], rows_by_group_list[1])
+
+    indexer_by_execution = {row.execution_ordinal: row for row in rows_by_group[1]}
+    executions = tuple(
+        DSAExecutionRow(
+            execution_ordinal=latent.execution_ordinal,
+            latent=latent,
+            indexer=indexer_by_execution.get(latent.execution_ordinal),
+        )
+        for latent in rows_by_group[0]
+    )
+
+    signature_payload = {
+        "abi_version": _DSA_KV_TOPOLOGY_ABI_VERSION,
+        "executions": [
+            {
+                "execution_ordinal": execution.execution_ordinal,
+                "latent": execution.latent.layer_name,
+                "indexer": (
+                    execution.indexer.layer_name
+                    if execution.indexer is not None
+                    else None
+                ),
+            }
+            for execution in executions
+        ],
+        "rows_by_group": [
+            [
+                {
+                    "layer_name": row.layer_name,
+                    "execution_ordinal": row.execution_ordinal,
+                    "kv_group": row.kv_group,
+                    "row_ordinal": row.row_ordinal,
+                    "bank": row.bank,
+                    "spec": _dsa_spec_geometry(kv_cache_specs[row.layer_name]),
+                }
+                for row in group_rows
+            ]
+            for group_rows in rows_by_group
+        ],
+    }
+    canonical_payload = json.dumps(
+        signature_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    signature = hashlib.sha256(canonical_payload).hexdigest()
+    return DSAKVTopology(
+        executions=executions,
+        rows_by_group=rows_by_group,
+        signature=signature,
+    )
+
 
 # The hash seed for the first block of any prefix block sequence.
 #
@@ -794,6 +965,13 @@ def is_kv_cache_spec_uniform(kv_cache_spec: dict[str, KVCacheSpec]) -> bool:
         # regarded as uniform.
         return True
     if dsa_two_groups_enabled():
+        registered_groups = {
+            registration.kv_group
+            for spec in kv_cache_spec.values()
+            if (registration := spec.dsa_kv_registration) is not None
+        }
+        if len(registered_groups) > 1:
+            return False
         # DSA un-bundle: MLA latent (576) and indexer (128) must not merge into
         # one spec/group — they form separate groups with per-group block pools.
         head_sizes = {
@@ -1035,22 +1213,50 @@ def _get_kv_cache_groups_dsa_two_groups(
     Returns:
         The generated KVCacheGroupSpecs (group 0 = LATENT, group 1 = INDEXER)
     """
-    same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
-    for layer_name, layer_spec in kv_cache_spec.items():
-        same_type_layers[layer_spec].append(layer_name)
-    if len(same_type_layers) != 2:
-        raise ValueError(
-            "DSA two-group mode expects exactly two KV cache specs "
-            "(latent + indexer), got "
-            f"{len(same_type_layers)} distinct specs."
-        )
-    groups = [
-        KVCacheGroupSpec(layer_names, spec)
-        for spec, layer_names in same_type_layers.items()
-    ]
-    # Sort by descending page size so the latent group is group 0 (KV
-    # connectors that only handle the latent consume block_ids[0]).
-    groups.sort(key=lambda g: -g.kv_cache_spec.page_size_bytes)
+    registrations = {
+        layer_name: spec.dsa_kv_registration
+        for layer_name, spec in kv_cache_spec.items()
+        if spec.dsa_kv_registration is not None
+    }
+    if registrations:
+        missing_registrations = sorted(set(kv_cache_spec) - set(registrations))
+        if missing_registrations:
+            raise ValueError(
+                "DSA two-group mode has missing registrations for cache "
+                f"layers: {missing_registrations}."
+            )
+        grouped_layer_names = [[], []]
+        for layer_name, registration in registrations.items():
+            assert registration is not None
+            if registration.kv_group not in (0, 1):
+                raise ValueError(
+                    "DSA two-group mode only supports group 0 LATENT and "
+                    f"group 1 INDEXER, got {registration.kv_group}."
+                )
+            grouped_layer_names[registration.kv_group].append(layer_name)
+        if not grouped_layer_names[0] or not grouped_layer_names[1]:
+            raise ValueError(
+                "DSA two-group mode requires non-empty LATENT group 0 and "
+                "physical INDEXER group 1."
+            )
+        groups = create_kv_cache_group_specs(kv_cache_spec, grouped_layer_names)
+    else:
+        same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+        for layer_name, layer_spec in kv_cache_spec.items():
+            same_type_layers[layer_spec].append(layer_name)
+        if len(same_type_layers) != 2:
+            raise ValueError(
+                "DSA two-group mode expects exactly two KV cache specs "
+                "(latent + indexer), got "
+                f"{len(same_type_layers)} distinct specs."
+            )
+        groups = [
+            KVCacheGroupSpec(layer_names, spec)
+            for spec, layer_names in same_type_layers.items()
+        ]
+        # Legacy registrations have no semantic metadata. Keep the existing
+        # geometry fallback for profiling and direct utility callers.
+        groups.sort(key=lambda g: -g.kv_cache_spec.page_size_bytes)
     latent_layers = len(groups[0].layer_names)
     indexer_layers = len(groups[1].layer_names)
     if indexer_layers <= 0 or indexer_layers > latent_layers:
@@ -1197,6 +1403,7 @@ def get_kv_cache_config_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
+    dsa_kv_topology: DSAKVTopology | None = None,
 ) -> KVCacheConfig:
     """
     Generate the KV cache configuration from the KV cache groups and spec
@@ -1206,6 +1413,7 @@ def get_kv_cache_config_from_groups(
         vllm_config: The global VllmConfig
         kv_cache_groups: The KV cache groups
         available_memory: Memory available for KV cache in bytes
+        dsa_kv_topology: Canonical global DSA topology, when enabled
     Returns:
         The generated KVCacheConfig
     """
@@ -1225,6 +1433,7 @@ def get_kv_cache_config_from_groups(
             num_blocks=1,
             kv_cache_tensors=[],
             kv_cache_groups=kv_cache_groups,
+            dsa_kv_topology=dsa_kv_topology,
             dsa_index_topk=dsa_index_topk,
             dsa_num_speculative_tokens=dsa_num_speculative_tokens,
         )
@@ -1254,12 +1463,15 @@ def get_kv_cache_config_from_groups(
         if dsa_shared_pool_enabled():
             if len(kv_cache_groups) != 2:
                 raise ValueError("DSA shared pool expects exactly two KV groups.")
-            latent_group = max(
-                kv_cache_groups, key=lambda g: g.kv_cache_spec.page_size_bytes
-            )
-            indexer_group = min(
-                kv_cache_groups, key=lambda g: g.kv_cache_spec.page_size_bytes
-            )
+            if dsa_kv_topology is not None:
+                latent_group, indexer_group = kv_cache_groups
+            else:
+                latent_group = max(
+                    kv_cache_groups, key=lambda g: g.kv_cache_spec.page_size_bytes
+                )
+                indexer_group = min(
+                    kv_cache_groups, key=lambda g: g.kv_cache_spec.page_size_bytes
+                )
             latent_layers = len(latent_group.layer_names)
             indexer_layers = len(indexer_group.layer_names)
             if not 0 < indexer_layers <= latent_layers:
@@ -1402,20 +1614,42 @@ def get_kv_cache_config_from_groups(
                 sparse_decode_capacity >= max_num_seqs,
             )
 
-            # Pair latent and indexer layers by exact sibling name
-            # (<layer>.self_attn.attn <-> <layer>.self_attn.indexer.k_cache).
-            # With a shared indexer only producer layers have an indexer
-            # sibling; consumer layers get a latent-only tensor. Never fall
-            # back to positional zip(): with unequal group sizes it would
-            # silently mis-pair or truncate layers.
+            # Pair from the canonical execution mapping when available. Legacy
+            # direct callers retain exact sibling-name matching, never a
+            # positional zip that could truncate unequal groups.
             indexer_by_name = set(indexer_group.layer_names)
             used_indexers: set[str] = set()
             kv_cache_tensors: list[KVCacheTensor] = []
             paired_layers = 0
             latent_only_layers = 0
+            explicit_indexer_by_latent = (
+                {
+                    execution.latent.layer_name: (
+                        execution.indexer.layer_name
+                        if execution.indexer is not None
+                        else None
+                    )
+                    for execution in dsa_kv_topology.executions
+                }
+                if dsa_kv_topology is not None
+                else None
+            )
             for latent_name in latent_group.layer_names:
-                sibling = latent_name.rsplit(".", 1)[0] + ".indexer.k_cache"
-                if sibling in indexer_by_name:
+                if explicit_indexer_by_latent is not None:
+                    if latent_name not in explicit_indexer_by_latent:
+                        raise ValueError(
+                            "DSA shared pool LATENT layer is missing from the "
+                            f"canonical topology: {latent_name!r}."
+                        )
+                    sibling = explicit_indexer_by_latent[latent_name]
+                    if sibling is not None and sibling not in indexer_by_name:
+                        raise ValueError(
+                            "DSA shared pool is missing the projected physical "
+                            f"INDEXER layer {sibling!r} for {latent_name!r}."
+                        )
+                else:
+                    sibling = latent_name.rsplit(".", 1)[0] + ".indexer.k_cache"
+                if sibling is not None and sibling in indexer_by_name:
                     kv_cache_tensors.append(
                         KVCacheTensor(
                             size=tensor_size, shared_by=[latent_name, sibling]
@@ -1453,6 +1687,7 @@ def get_kv_cache_config_from_groups(
                 num_blocks=num_bundles,
                 kv_cache_tensors=kv_cache_tensors,
                 kv_cache_groups=kv_cache_groups,
+                dsa_kv_topology=dsa_kv_topology,
                 dsa_index_topk=dsa_index_topk,
                 dsa_num_speculative_tokens=dsa_num_speculative_tokens,
             )
@@ -1571,6 +1806,7 @@ def get_kv_cache_config_from_groups(
             num_blocks=num_blocks,
             kv_cache_tensors=kv_cache_tensors,
             kv_cache_groups=kv_cache_groups,
+            dsa_kv_topology=dsa_kv_topology,
             num_blocks_per_group=num_blocks_per_group,
             dsa_index_topk=dsa_index_topk,
             dsa_num_speculative_tokens=dsa_num_speculative_tokens,
@@ -1607,6 +1843,7 @@ def get_kv_cache_config_from_groups(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        dsa_kv_topology=dsa_kv_topology,
         dsa_index_topk=dsa_index_topk,
         dsa_num_speculative_tokens=dsa_num_speculative_tokens,
     )
@@ -1623,6 +1860,13 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     """
 
     if dsa_two_groups_enabled():
+        registered_groups = {
+            registration.kv_group
+            for spec in kv_cache_spec.values()
+            if (registration := spec.dsa_kv_registration) is not None
+        }
+        if len(registered_groups) > 1:
+            return
         head_sizes = {
             spec.head_size
             for spec in kv_cache_spec.values()
@@ -1719,7 +1963,15 @@ def get_kv_cache_groups(
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
 
-    if dsa_two_groups_enabled() and not is_kv_cache_page_size_uniform(kv_cache_spec):
+    registered_dsa_groups = {
+        registration.kv_group
+        for spec in kv_cache_spec.values()
+        if (registration := spec.dsa_kv_registration) is not None
+    }
+    if dsa_two_groups_enabled() and (
+        len(registered_dsa_groups) > 1
+        or not is_kv_cache_page_size_uniform(kv_cache_spec)
+    ):
         # DSA two-group mode: latent (page 147456) and indexer (page 32768) keep
         # their true page sizes and are backed by per-group block pools, so no
         # page-size unification is needed. Aggregate by semantic role so the
@@ -1751,7 +2003,9 @@ def generate_scheduler_kv_cache_config(
     )
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
+    dsa_kv_topology = kv_cache_configs[0].dsa_kv_topology
     cfg = copy.deepcopy(kv_cache_configs[0])
+    cfg.dsa_kv_topology = dsa_kv_topology
     for group in cfg.kv_cache_groups:
         if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
             # All layers in the UniformTypeKVCacheSpecs have the same type,
@@ -2103,11 +2357,51 @@ def get_kv_cache_configs(
                     "The KV cache specs for the same layer are different "
                     "across workers. This is not supported yet."
                 )
+                if (
+                    merged_kv_cache_specs[layer_name].dsa_kv_registration
+                    != layer_spec.dsa_kv_registration
+                ):
+                    raise ValueError(
+                        "The DSA KV registrations for the same layer conflict "
+                        f"across workers: {layer_name!r}."
+                    )
 
     # Get global KV cache groups. This also handles spec unification for
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+
+    dsa_kv_topology = None
+    has_dsa_registrations = any(
+        spec.dsa_kv_registration is not None for spec in merged_kv_cache_specs.values()
+    )
+    has_dsa_two_group_layout = (
+        dsa_two_groups_enabled()
+        and len(global_kv_cache_groups) == 2
+        and all(
+            isinstance(group.kv_cache_spec, MLAAttentionSpec)
+            for group in global_kv_cache_groups
+        )
+    )
+    if dsa_two_groups_enabled() and (has_dsa_registrations or has_dsa_two_group_layout):
+        if has_dsa_two_group_layout and not has_dsa_registrations:
+            raise ValueError(
+                "DSA two-group final KV specs are missing authoritative model "
+                "registrations; the worker must preserve dsa_kv_registration."
+            )
+        dsa_kv_topology = build_dsa_kv_topology(merged_kv_cache_specs)
+        logger.info(
+            "DSA KV topology: signature=%s latent_rows=%d indexer_rows=%d "
+            "producer_executions=%s.",
+            dsa_kv_topology.signature,
+            len(dsa_kv_topology.rows_by_group[0]),
+            len(dsa_kv_topology.rows_by_group[1]),
+            [
+                execution.execution_ordinal
+                for execution in dsa_kv_topology.executions
+                if execution.indexer is not None
+            ],
+        )
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
@@ -2142,7 +2436,10 @@ def get_kv_cache_configs(
         ), "Some layers are not assigned to any group."
         kv_cache_configs.append(
             get_kv_cache_config_from_groups(
-                vllm_config, projected_groups, available_memory_one_worker
+                vllm_config,
+                projected_groups,
+                available_memory_one_worker,
+                dsa_kv_topology=dsa_kv_topology,
             )
         )
 

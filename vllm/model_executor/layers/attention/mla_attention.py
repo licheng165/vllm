@@ -267,6 +267,7 @@ from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
+    DSAKVRegistration,
     KVCacheSpec,
     MLAAttentionSpec,
 )
@@ -305,6 +306,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         indexer: object | None = None,
         topk_indices_buffer: torch.Tensor | None = None,
         skip_topk: bool = False,
+        dsa_kv_registration: DSAKVRegistration | None = None,
         **extra_impl_args,
     ):
         super().__init__()
@@ -320,6 +322,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.layer_name = prefix
         self.indexer = indexer
         self.skip_topk = skip_topk
+        self.dsa_kv_registration = dsa_kv_registration
 
         self.num_kv_heads = 1
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -857,6 +860,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             head_size=self.head_size,
             dtype=kv_cache_dtype,
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            dsa_kv_registration=self.dsa_kv_registration,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):

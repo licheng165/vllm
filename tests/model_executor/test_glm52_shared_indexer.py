@@ -20,6 +20,7 @@ import torch
 
 from vllm.config import CacheConfig, DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLAAttention
+from vllm.v1.kv_cache_interface import DSAKVRegistration
 
 pytestmark = pytest.mark.cpu_test
 
@@ -156,6 +157,8 @@ def test_glm52_shared_layer_omits_indexer(
     assert attn.mla_attn.skip_topk is True
     # no indexer weights on a shared-consumer layer
     assert not [n for n, _ in attn.named_parameters() if n.startswith("indexer.")]
+    latent_spec = attn.mla_attn.mla_attn.get_kv_cache_spec(_vllm_config(cfg))
+    assert latent_spec.dsa_kv_registration == DSAKVRegistration(3, 0)
 
 
 def test_glm52_producer_layer_keeps_full_indexer(
@@ -178,6 +181,10 @@ def test_glm52_producer_layer_keeps_full_indexer(
     assert hasattr(attn.indexer, "weights_proj")
     assert attn.indexer.topk_indices_buffer is buffer
     assert [n for n, _ in attn.named_parameters() if n.startswith("indexer.")]
+    latent_spec = attn.mla_attn.mla_attn.get_kv_cache_spec(_vllm_config(cfg))
+    indexer_spec = attn.indexer.k_cache.get_kv_cache_spec(_vllm_config(cfg))
+    assert latent_spec.dsa_kv_registration == DSAKVRegistration(6, 0)
+    assert indexer_spec.dsa_kv_registration == DSAKVRegistration(6, 1)
 
 
 def test_glm52_mtp_layer_always_keeps_indexer(
@@ -195,6 +202,10 @@ def test_glm52_mtp_layer_always_keeps_indexer(
     )
     assert attn.indexer is not None
     assert attn.skip_topk is False
+    latent_spec = attn.mla_attn.mla_attn.get_kv_cache_spec(_vllm_config(cfg))
+    indexer_spec = attn.indexer.k_cache.get_kv_cache_spec(_vllm_config(cfg))
+    assert latent_spec.dsa_kv_registration == DSAKVRegistration(78, 0)
+    assert indexer_spec.dsa_kv_registration == DSAKVRegistration(78, 1)
 
 
 def test_glm51_keeps_indexer_on_every_layer(

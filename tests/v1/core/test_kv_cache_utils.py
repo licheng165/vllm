@@ -3,6 +3,7 @@
 import hashlib
 import importlib
 from collections.abc import Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -10,7 +11,7 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import DeviceConfig, ModelConfig, SchedulerConfig, VllmConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
@@ -25,6 +26,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     FreeKVCacheBlockQueue,
     KVCacheBlock,
+    build_dsa_kv_topology,
     estimate_max_model_len,
     generate_block_hash_extra_keys,
     generate_scheduler_kv_cache_config,
@@ -39,6 +41,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    DSAKVRegistration,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -220,12 +223,22 @@ def _glm52_like_layer_names(num_layers: int = 78, mtp: int = 1):
     return latent_names, indexer_names
 
 
-def _new_dsa_mla_spec(head_size: int, block_size: int = 16):
+def _new_dsa_mla_spec(
+    head_size: int,
+    block_size: int = 16,
+    execution_ordinal: int | None = None,
+    kv_group: int | None = None,
+):
+    registration = None
+    if execution_ordinal is not None:
+        assert kv_group is not None
+        registration = DSAKVRegistration(execution_ordinal, kv_group)
     return MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
         head_size=head_size,
         dtype=torch.float32,
+        dsa_kv_registration=registration,
     )
 
 
@@ -400,6 +413,188 @@ def test_dsa_nonshared_two_groups_unequal_counts(monkeypatch):
     assert len(result.kv_cache_tensors) == 79 + 22
     assert result.num_blocks_per_group is not None
     assert len(result.num_blocks_per_group) == 2
+
+
+def _registered_glm52_specs() -> dict[str, KVCacheSpec]:
+    producer_executions = {0, 1, 2} | {6 + 4 * i for i in range(18)} | {78}
+    specs = {
+        f"latent.execution.{execution}": _new_dsa_mla_spec(
+            head_size=576, execution_ordinal=execution, kv_group=0
+        )
+        for execution in range(79)
+    }
+    specs.update(
+        {
+            f"physical.indexer.{execution}": _new_dsa_mla_spec(
+                head_size=128, execution_ordinal=execution, kv_group=1
+            )
+            for execution in producer_executions
+        }
+    )
+    return specs
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsa_registration_does_not_affect_spec_identity():
+    unregistered = _new_dsa_mla_spec(head_size=576)
+    registered = replace(
+        unregistered,
+        dsa_kv_registration=DSAKVRegistration(execution_ordinal=6, kv_group=0),
+    )
+
+    assert registered == unregistered
+    assert hash(registered) == hash(unregistered)
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsa_topology_79_22_execution_goldens_and_consumers():
+    topology = build_dsa_kv_topology(_registered_glm52_specs())
+
+    assert len(topology.executions) == 79
+    assert tuple(len(rows) for rows in topology.rows_by_group) == (79, 22)
+    assert len(topology.signature) == hashlib.sha256().digest_size * 2
+    assert all(row.bank == row.row_ordinal % 2 for row in topology.rows_by_group[0])
+    assert all(row.bank == row.row_ordinal % 2 for row in topology.rows_by_group[1])
+
+    execution_6 = topology.executions[6]
+    assert (execution_6.latent.row_ordinal, execution_6.latent.bank) == (6, 0)
+    assert execution_6.indexer is not None
+    assert (execution_6.indexer.row_ordinal, execution_6.indexer.bank) == (3, 1)
+
+    execution_78 = topology.executions[78]
+    assert (execution_78.latent.row_ordinal, execution_78.latent.bank) == (78, 0)
+    assert execution_78.indexer is not None
+    assert (execution_78.indexer.row_ordinal, execution_78.indexer.bank) == (21, 1)
+
+    assert all(topology.executions[i].indexer is None for i in (3, 4, 5, 77))
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsa_topology_signature_is_canonical_and_geometry_sensitive():
+    specs = _registered_glm52_specs()
+    reordered_specs = dict(reversed(list(specs.items())))
+    changed_geometry = dict(specs)
+    changed_geometry["latent.execution.0"] = replace(
+        changed_geometry["latent.execution.0"], block_size=32
+    )
+    changed_dtype = dict(specs)
+    changed_dtype["latent.execution.0"] = replace(
+        changed_dtype["latent.execution.0"], dtype=torch.float16
+    )
+
+    signature = build_dsa_kv_topology(specs).signature
+    assert build_dsa_kv_topology(reordered_specs).signature == signature
+    assert build_dsa_kv_topology(changed_geometry).signature != signature
+    assert build_dsa_kv_topology(changed_dtype).signature != signature
+
+
+@pytest.mark.parametrize(
+    ("specs", "error"),
+    [
+        (
+            {
+                "latent.0": _new_dsa_mla_spec(576, execution_ordinal=0, kv_group=0),
+                "latent.duplicate": _new_dsa_mla_spec(
+                    576, execution_ordinal=0, kv_group=0
+                ),
+                "indexer.0": _new_dsa_mla_spec(128, execution_ordinal=0, kv_group=1),
+            },
+            "duplicate registrations",
+        ),
+        (
+            {
+                "latent.0": _new_dsa_mla_spec(576, execution_ordinal=0, kv_group=0),
+                "indexer.missing": _new_dsa_mla_spec(128),
+            },
+            "missing registrations",
+        ),
+        (
+            {
+                "latent.0": _new_dsa_mla_spec(576, execution_ordinal=0, kv_group=0),
+                "indexer.1": _new_dsa_mla_spec(128, execution_ordinal=1, kv_group=1),
+            },
+            "orphan INDEXER",
+        ),
+        (
+            {
+                "latent.0": _new_dsa_mla_spec(576, execution_ordinal=0, kv_group=0),
+                "latent.2": _new_dsa_mla_spec(576, execution_ordinal=2, kv_group=0),
+                "indexer.0": _new_dsa_mla_spec(128, execution_ordinal=0, kv_group=1),
+            },
+            "missing LATENT executions",
+        ),
+    ],
+    ids=["duplicate", "missing-registration", "orphan-indexer", "latent-hole"],
+)
+@pytest.mark.skip_global_cleanup
+def test_invalid_dsa_topology_fails_closed(specs, error):
+    with pytest.raises(ValueError, match=error):
+        build_dsa_kv_topology(specs)
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsa_global_topology_is_shared_by_projected_configs(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    specs = _registered_glm52_specs()
+    worker_specs = [specs, dict(reversed(list(specs.items())))]
+
+    configs = get_kv_cache_configs(
+        vllm_config,
+        worker_specs,
+        [2**30, 2**29],
+    )
+
+    topology = configs[0].dsa_kv_topology
+    assert topology is not None
+    assert configs[1].dsa_kv_topology is topology
+    assert [len(group.layer_names) for group in configs[0].kv_cache_groups] == [79, 22]
+    shared_by_counts = [len(tensor.shared_by) for tensor in configs[0].kv_cache_tensors]
+    assert shared_by_counts.count(2) == 22
+    assert shared_by_counts.count(1) == 57
+
+    scheduler_config = generate_scheduler_kv_cache_config(configs)
+    assert scheduler_config.dsa_kv_topology is topology
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsa_topology_is_inert_when_two_group_feature_is_off(monkeypatch):
+    monkeypatch.delenv("VLLM_ASCEND_DSA_TWO_GROUPS", raising=False)
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16),
+        device_config=DeviceConfig(device="cpu"),
+    )
+
+    config = get_kv_cache_configs(
+        vllm_config,
+        [_registered_glm52_specs()],
+        [2**30],
+    )[0]
+
+    assert config.dsa_kv_topology is None
+    assert len(config.kv_cache_groups) == 1
+
+
+@pytest.mark.skip_global_cleanup
+def test_dsa_topology_missing_final_spec_registrations_fails_closed(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    vllm_config = VllmConfig(
+        model_config=ModelConfig(max_model_len=16),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    latent_names, indexer_names = _glm52_like_layer_names()
+    specs = {
+        **{name: _new_dsa_mla_spec(576) for name in latent_names},
+        **{name: _new_dsa_mla_spec(128) for name in indexer_names},
+    }
+
+    with pytest.raises(ValueError, match="missing authoritative model registrations"):
+        get_kv_cache_configs(vllm_config, [specs], [2**30])
 
 
 @pytest.mark.parametrize("hash_fn", [sha256, sha256_cbor])

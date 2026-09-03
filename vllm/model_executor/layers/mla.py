@@ -8,6 +8,7 @@ from vllm.config import CacheConfig
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.v1.kv_cache_interface import DSAKVRegistration
 
 
 @dataclass
@@ -28,6 +29,7 @@ class MLAModules:
     topk_indices_buffer: torch.Tensor | None
     indexer_rotary_emb: torch.nn.Module | None = None
     skip_topk: bool = False
+    dsa_kv_registration: DSAKVRegistration | None = None
 
 
 # --8<-- [start:multi_head_latent_attention]
@@ -115,6 +117,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             indexer=self.indexer,
             topk_indices_buffer=mla_modules.topk_indices_buffer,
             skip_topk=self.skip_topk,
+            dsa_kv_registration=mla_modules.dsa_kv_registration,
         )
 
         self.prefix = prefix

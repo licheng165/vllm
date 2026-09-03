@@ -3,7 +3,7 @@
 
 import copy
 import os
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, field, fields, replace
 from math import prod
 
 import torch
@@ -48,6 +48,37 @@ def dsa_shrink_stage() -> int:
 
 
 @dataclass(frozen=True)
+class DSAKVRegistration:
+    """Model-provided identity for one physical DSA KV cache layer."""
+
+    execution_ordinal: int
+    kv_group: int
+
+
+@dataclass(frozen=True)
+class DSAKVRow:
+    layer_name: str
+    execution_ordinal: int
+    kv_group: int
+    row_ordinal: int
+    bank: int
+
+
+@dataclass(frozen=True)
+class DSAExecutionRow:
+    execution_ordinal: int
+    latent: DSAKVRow
+    indexer: DSAKVRow | None
+
+
+@dataclass(frozen=True)
+class DSAKVTopology:
+    executions: tuple[DSAExecutionRow, ...]
+    rows_by_group: tuple[tuple[DSAKVRow, ...], ...]
+    signature: str
+
+
+@dataclass(frozen=True)
 class KVCacheSpec:
     """
     A base class for specifying the KV cache format of one layer.
@@ -55,6 +86,10 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+    # This is model identity metadata, not part of the physical cache format.
+    dsa_kv_registration: DSAKVRegistration | None = field(
+        default=None, compare=False, hash=False, repr=False, kw_only=True
+    )
 
     @property
     def page_size_bytes(self) -> int:
@@ -196,6 +231,8 @@ class FullAttentionSpec(AttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if not f.compare:
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
@@ -389,6 +426,8 @@ class SinkFullAttentionSpec(FullAttentionSpec):
         )
         for spec in specs:
             for f in fields(AttentionSpec):
+                if not f.compare:
+                    continue
                 assert getattr(spec, f.name) == getattr(merged_spec, f.name), (
                     "All attention layers in the same KV cache group must have "
                     "the same attention spec."
@@ -430,6 +469,13 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
         Whether all layers have the same type of KV cache spec.
         """
         if dsa_two_groups_enabled():
+            registered_groups = {
+                registration.kv_group
+                for spec in kv_cache_specs.values()
+                if (registration := spec.dsa_kv_registration) is not None
+            }
+            if len(registered_groups) > 1:
+                return False
             # DSA un-bundle: MLA latent (576) and indexer (128) specs must form
             # separate groups (per-group block pools) so the latent blocks can be
             # freed independently. Do not collapse them into one uniform-type group.
@@ -531,6 +577,9 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+
+    dsa_kv_topology: DSAKVTopology | None = None
+    """Canonical global DSA KV topology shared by every worker config."""
 
     num_blocks_per_group: list[int] | None = None
     """DSA two-group mode with per-group pools: pool size per group (latent
