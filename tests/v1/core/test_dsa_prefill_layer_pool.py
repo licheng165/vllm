@@ -28,6 +28,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     DSAKVRegistration,
+    DSAKVRow,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
@@ -68,6 +69,14 @@ _GLM52_INDEXER_EXECUTIONS = (
     74,
     78,
 )
+
+
+class _CapableGPUModelRunner(GPUModelRunner):
+    supports_layerwise_prefill_p_node = True
+
+
+class _CapableGPUModelRunnerV2(GPUModelRunnerV2):
+    supports_layerwise_prefill_p_node = True
 
 
 def _enable_layerwise_prefill(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -544,8 +553,76 @@ def test_worker_variants_fail_before_state_update(
         lambda *_: pytest.fail("worker state must not be mutated"),
     )
 
-    with pytest.raises(RuntimeError, match="Stage 3 worker data-plane"):
+    with pytest.raises(RuntimeError, match="did not opt in"):
         runner.execute_model(SchedulerOutput.make_empty())
+
+
+@pytest.mark.parametrize(
+    ("runner_cls", "mutation_method"),
+    [
+        (_CapableGPUModelRunner, "_update_states"),
+        (_CapableGPUModelRunnerV2, "finish_requests"),
+    ],
+)
+def test_capable_worker_variants_reach_state_update(
+    monkeypatch, runner_cls, mutation_method
+):
+    class StateUpdateReached(Exception):
+        pass
+
+    runner = runner_cls.__new__(runner_cls)
+    runner.layerwise_prefill_p_node = True
+    runner.execute_model_state = None
+    runner.routed_experts_initialized = False
+    runner.speculative_config = None
+    runner.prepare_inputs_event = None
+
+    def state_update_reached(*_args, **_kwargs):
+        raise StateUpdateReached
+
+    monkeypatch.setattr(runner, mutation_method, state_update_reached)
+    with pytest.raises(StateUpdateReached):
+        runner.execute_model(SchedulerOutput.make_empty())
+
+
+def test_capable_worker_exposes_generation_and_canonical_bank_metadata():
+    runner = _CapableGPUModelRunner.__new__(_CapableGPUModelRunner)
+    runner.layerwise_prefill_p_node = True
+    runner.input_batch = SimpleNamespace(req_ids=["req"])
+    runner.requests = {
+        "req": SimpleNamespace(
+            block_ids=([1], [2]),
+            block_ids_by_bank=(([1], [2]), ([11], [12])),
+            block_allocation_mode=DSABlockAllocationMode.PREFILL_CHILD,
+            allocation_generation=9,
+        )
+    }
+    indexer_row = DSAKVRow(
+        layer_name="indexer",
+        execution_ordinal=6,
+        kv_group=1,
+        row_ordinal=3,
+        bank=1,
+    )
+    execution = SimpleNamespace(latent=object(), indexer=indexer_row)
+    runner.dsa_kv_rows_by_layer_name = {indexer_row.layer_name: indexer_row}
+    runner.dsa_kv_executions_by_ordinal = {indexer_row.execution_ordinal: execution}
+
+    assert runner.get_layerwise_prefill_request_generations() == (("req", 9),)
+    assert runner.get_layerwise_prefill_block_ids("req", indexer_row, 9) == [12]
+    with pytest.raises(RuntimeError, match="uint64 allocation generation"):
+        runner.get_layerwise_prefill_block_ids("req", indexer_row, True)
+    with pytest.raises(RuntimeError, match="stale.*allocation generation"):
+        runner.get_layerwise_prefill_block_ids("req", indexer_row, 8)
+    with pytest.raises(RuntimeError, match="absent from the runtime topology"):
+        runner.get_layerwise_prefill_block_ids(
+            "req",
+            DSAKVRow("fabricated", 6, 1, 3, 1),
+            9,
+        )
+    runner.requests["req"].allocation_generation = True
+    with pytest.raises(RuntimeError, match="must be a uint64 value"):
+        runner.get_layerwise_prefill_request_generations()
 
 
 def test_common_input_boundary_guards_overriding_runners():
@@ -554,7 +631,7 @@ def test_common_input_boundary_guards_overriding_runners():
     runner.prepare_inputs_event = None
 
     with (
-        pytest.raises(RuntimeError, match="Stage 3 worker data-plane"),
+        pytest.raises(RuntimeError, match="did not opt in"),
         runner.synchronize_input_prep(),
     ):
         pytest.fail("guard must run before overridden worker state updates")

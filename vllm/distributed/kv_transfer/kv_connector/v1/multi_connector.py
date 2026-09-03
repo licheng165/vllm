@@ -18,6 +18,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     KVConnectorWorkerMetadata,
+    LayerwisePrefillCallbackMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
@@ -165,6 +166,7 @@ class MultiConnector(KVConnectorBase_V1):
         ):
             self._connectors.append(connector_cls(temp_config, role, kv_cache_config))
             self._ktc_kv_transfer_config.append(temp_config.kv_transfer_config)
+        self._freeze_layerwise_prefill_capabilities()
 
         # A mapping from request id to the index of the connector chosen to
         # load the request from (if any).
@@ -181,6 +183,58 @@ class MultiConnector(KVConnectorBase_V1):
         if not self._connectors:
             return False
         return all(c.prefer_cross_layer_blocks for c in self._connectors)
+
+    @property
+    def supports_layerwise_prefill_eager_callbacks(self) -> bool:
+        return self._supports_layerwise_prefill_eager_callbacks
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        return self._supports_dsa_index_lmcache
+
+    @property
+    def supports_layerwise_prefill_p_node(self) -> bool:
+        return bool(self._layerwise_prefill_callbacks)
+
+    def _freeze_layerwise_prefill_capabilities(self) -> None:
+        callbacks = []
+        for connector in self._connectors:
+            if connector.supports_layerwise_prefill_p_node is not True:
+                continue
+            if (
+                connector.supports_layerwise_prefill_eager_callbacks is not True
+                or connector.supports_dsa_index_lmcache is not True
+            ):
+                raise RuntimeError(
+                    "A child connector advertises complete layerwise-prefill "
+                    "P-node support without both component capabilities"
+                )
+            wait = getattr(connector, "wait_for_layerwise_prefill_load", None)
+            save = getattr(connector, "save_layerwise_prefill_kv_layer", None)
+            if (
+                not callable(wait)
+                or not callable(save)
+                or getattr(wait, "__func__", None)
+                is KVConnectorBase_V1.wait_for_layerwise_prefill_load
+                or getattr(save, "__func__", None)
+                is KVConnectorBase_V1.save_layerwise_prefill_kv_layer
+            ):
+                raise RuntimeError(
+                    "A child connector advertises layerwise-prefill P-node "
+                    "support without both synchronous callbacks"
+                )
+            callbacks.append((wait, save))
+        self._supports_layerwise_prefill_eager_callbacks = any(
+            connector.supports_layerwise_prefill_eager_callbacks is True
+            for connector in self._connectors
+        )
+        self._supports_dsa_index_lmcache = any(
+            connector.supports_dsa_index_lmcache is True
+            for connector in self._connectors
+        )
+        # Component capabilities on different children cannot jointly provide
+        # the per-row bank protocol.
+        self._layerwise_prefill_callbacks = tuple(callbacks)
 
     @classmethod
     def _get_connector_classes_and_configs(
@@ -263,6 +317,17 @@ class MultiConnector(KVConnectorBase_V1):
         for c in self._connectors:
             c.wait_for_layer_load(layer_name)
 
+    def wait_for_layerwise_prefill_load(
+        self, metadata: LayerwisePrefillCallbackMetadata
+    ) -> None:
+        if not self._layerwise_prefill_callbacks:
+            raise RuntimeError(
+                "At least one connector must support synchronous "
+                "layerwise-prefill callbacks"
+            )
+        for wait, _ in self._layerwise_prefill_callbacks:
+            wait(metadata)
+
     def save_kv_layer(
         self,
         layer_name: str,
@@ -272,6 +337,21 @@ class MultiConnector(KVConnectorBase_V1):
     ) -> None:
         for c in self._connectors:
             c.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
+
+    def save_layerwise_prefill_kv_layer(
+        self,
+        metadata: LayerwisePrefillCallbackMetadata,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> None:
+        if not self._layerwise_prefill_callbacks:
+            raise RuntimeError(
+                "At least one connector must support synchronous "
+                "layerwise-prefill callbacks"
+            )
+        for _, save in self._layerwise_prefill_callbacks:
+            save(metadata, kv_layer, attn_metadata, **kwargs)
 
     def wait_for_save(self):
         for c in self._connectors:

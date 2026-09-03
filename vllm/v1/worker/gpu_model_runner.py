@@ -137,6 +137,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
     CrossAttentionSpec,
+    DSAKVRow,
     EncoderOnlyAttentionSpec,
     FullAttentionSpec,
     KVCacheConfig,
@@ -236,12 +237,12 @@ def _validate_block_allocation_metadata(
         return
     if block_ids is None or block_ids_by_bank is None:
         raise RuntimeError("PREFILL_CHILD allocation is missing banked block IDs")
-    if allocation_generation is None:
-        raise RuntimeError("PREFILL_CHILD allocation is missing generation")
-    if not 0 < allocation_generation <= MAX_ALLOCATION_GENERATION:
-        raise RuntimeError(
-            "PREFILL_CHILD allocation_generation is outside uint64 range"
-        )
+    if (
+        not isinstance(allocation_generation, int)
+        or isinstance(allocation_generation, bool)
+        or not 0 < allocation_generation <= MAX_ALLOCATION_GENERATION
+    ):
+        raise RuntimeError("PREFILL_CHILD allocation_generation must be a uint64 value")
     if len(block_ids_by_bank) != LAYERWISE_PREFILL_BANK_COUNT:
         raise RuntimeError(
             "PREFILL_CHILD allocation must have exactly two physical banks"
@@ -452,6 +453,8 @@ class ExecuteModelState(NamedTuple):
 class GPUModelRunner(
     LoRAModelRunnerMixin, KVConnectorModelRunnerMixin, ECConnectorModelRunnerMixin
 ):
+    supports_layerwise_prefill_p_node = False
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1083,6 +1086,113 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.accelerator.synchronize()
 
+    def _ensure_layerwise_prefill_p_node_supported(self) -> None:
+        if (
+            getattr(self, "layerwise_prefill_p_node", False)
+            and self.supports_layerwise_prefill_p_node is not True
+        ):
+            raise RuntimeError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE requires a model runner "
+                "that explicitly supports PREFILL_CHILD bank metadata; "
+                f"{type(self).__name__} did not opt in."
+            )
+
+    def get_layerwise_prefill_request_generations(
+        self,
+    ) -> tuple[tuple[str, int], ...]:
+        """Return active request identities for synchronous eager callbacks."""
+        if not getattr(self, "layerwise_prefill_p_node", False):
+            return ()
+        self._ensure_layerwise_prefill_p_node_supported()
+        request_generations: list[tuple[str, int]] = []
+        for request_id in self.input_batch.req_ids:
+            request = self.requests[request_id]
+            if request.block_allocation_mode != DSABlockAllocationMode.PREFILL_CHILD:
+                raise RuntimeError(
+                    "layerwise prefill callback received a non-PREFILL_CHILD "
+                    f"request: request_id={request_id}"
+                )
+            _validate_block_allocation_metadata(
+                request.block_ids,
+                request.block_ids_by_bank,
+                request.block_allocation_mode,
+                request.allocation_generation,
+            )
+            assert request.allocation_generation is not None
+            request_generations.append((request_id, request.allocation_generation))
+        return tuple(request_generations)
+
+    def get_layerwise_prefill_block_ids(
+        self,
+        request_id: str,
+        row: DSAKVRow,
+        allocation_generation: int,
+    ) -> list[int]:
+        """Select one request's blocks using the canonical row group and bank."""
+        self._ensure_layerwise_prefill_p_node_supported()
+        request = self.requests[request_id]
+        if request.block_allocation_mode != DSABlockAllocationMode.PREFILL_CHILD:
+            raise RuntimeError(
+                "layerwise prefill callback received a non-PREFILL_CHILD "
+                f"request: request_id={request_id}"
+            )
+        _validate_block_allocation_metadata(
+            request.block_ids,
+            request.block_ids_by_bank,
+            request.block_allocation_mode,
+            request.allocation_generation,
+        )
+        assert request.block_ids_by_bank is not None
+        if (
+            not isinstance(allocation_generation, int)
+            or isinstance(allocation_generation, bool)
+            or not 0 < allocation_generation <= MAX_ALLOCATION_GENERATION
+        ):
+            raise RuntimeError(
+                "layerwise-prefill block lookup requires a uint64 allocation "
+                f"generation: request_id={request_id}"
+            )
+        if request.allocation_generation != allocation_generation:
+            raise RuntimeError(
+                "stale layerwise-prefill callback allocation generation: "
+                f"request_id={request_id}, expected={allocation_generation}, "
+                f"actual={request.allocation_generation}"
+            )
+        rows_by_layer_name = getattr(self, "dsa_kv_rows_by_layer_name", None)
+        executions_by_ordinal = getattr(
+            self,
+            "dsa_kv_executions_by_ordinal",
+            None,
+        )
+        canonical_row = (
+            rows_by_layer_name.get(row.layer_name)
+            if rows_by_layer_name is not None
+            else None
+        )
+        execution = (
+            executions_by_ordinal.get(row.execution_ordinal)
+            if executions_by_ordinal is not None
+            else None
+        )
+        if (
+            canonical_row != row
+            or execution is None
+            or row not in (execution.latent, execution.indexer)
+        ):
+            raise RuntimeError(
+                "layerwise-prefill block lookup row is absent from the "
+                f"runtime topology: request_id={request_id}, row={row!r}"
+            )
+        if not (
+            0 <= row.bank < len(request.block_ids_by_bank)
+            and 0 <= row.kv_group < len(request.block_ids_by_bank[row.bank])
+        ):
+            raise RuntimeError(
+                "canonical DSA row is outside PREFILL_CHILD bank metadata: "
+                f"request_id={request_id}, bank={row.bank}, group={row.kv_group}"
+            )
+        return request.block_ids_by_bank[row.bank][row.kv_group]
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1093,12 +1203,7 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        if getattr(self, "layerwise_prefill_p_node", False):
-            raise RuntimeError(
-                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE allocator metadata is "
-                "enabled, but Stage 3 worker data-plane consumption is not "
-                "implemented; refusing execution before worker state update."
-            )
+        self._ensure_layerwise_prefill_p_node_supported()
         _validate_cached_block_allocation_metadata(
             scheduler_output.scheduled_cached_reqs
         )
@@ -3448,12 +3553,7 @@ class GPUModelRunner(
 
     @contextmanager
     def synchronize_input_prep(self):
-        if getattr(self, "layerwise_prefill_p_node", False):
-            raise RuntimeError(
-                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE allocator metadata is "
-                "enabled, but Stage 3 worker data-plane consumption is not "
-                "implemented; refusing execution before worker state update."
-            )
+        self._ensure_layerwise_prefill_p_node_supported()
         if self.prepare_inputs_event is None:
             yield
             return
@@ -3751,12 +3851,7 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
-        if getattr(self, "layerwise_prefill_p_node", False):
-            raise RuntimeError(
-                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE allocator metadata is "
-                "enabled, but Stage 3 worker data-plane consumption is not "
-                "implemented; refusing execution before worker state update."
-            )
+        self._ensure_layerwise_prefill_p_node_supported()
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "

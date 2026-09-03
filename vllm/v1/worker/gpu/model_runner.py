@@ -103,6 +103,8 @@ logger = init_logger(__name__)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
+    supports_layerwise_prefill_p_node = False
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -883,11 +885,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
-        if getattr(self, "layerwise_prefill_p_node", False):
+        if (
+            getattr(self, "layerwise_prefill_p_node", False)
+            and self.supports_layerwise_prefill_p_node is not True
+        ):
             raise RuntimeError(
-                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE allocator metadata is "
-                "enabled, but Stage 3 worker data-plane consumption is not "
-                "implemented; refusing execution before worker state update."
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE requires a model runner "
+                "that explicitly supports PREFILL_CHILD bank metadata; "
+                f"{type(self).__name__} did not opt in."
             )
         if not dummy_run:
             # Update the request states.

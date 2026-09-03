@@ -9,12 +9,17 @@ import torch
 
 from vllm.distributed.kv_events import BlockStored
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorRole
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorRole,
+    LayerwisePrefillCallbackMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.lmcache_connector import (
     LMCacheConnectorV1,
     LMCacheKVEvents,
 )
 from vllm.v1.kv_cache_interface import (
+    DSAExecutionRow,
+    DSAKVRow,
     KVCacheConfig,
     KVCacheGroupSpec,
     MLAAttentionSpec,
@@ -140,6 +145,52 @@ def test_old_impl_keeps_single_group_compatibility(monkeypatch):
     assert observed["config"] is config
     assert observed["role"] is role
     assert observed["parent"] is connector
+
+
+def test_lmcache_delegates_synchronous_layerwise_prefill_abi():
+    wait = MagicMock()
+    save = MagicMock()
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = SimpleNamespace(
+        supports_layerwise_prefill_eager_callbacks=True,
+        supports_dsa_index_lmcache=True,
+        wait_for_layerwise_prefill_load=wait,
+        save_layerwise_prefill_kv_layer=save,
+    )
+    connector._freeze_layerwise_prefill_capabilities()
+    latent = DSAKVRow("latent", 6, 0, 6, 0)
+    indexer = DSAKVRow("indexer", 6, 1, 3, 1)
+    callback = LayerwisePrefillCallbackMetadata(
+        DSAExecutionRow(6, latent, indexer), indexer, (("req", 23),)
+    )
+    kv_layer = object()
+    attn_metadata = object()
+
+    assert connector.supports_layerwise_prefill_p_node is True
+    connector._lmcache_engine.supports_layerwise_prefill_eager_callbacks = False
+    connector._lmcache_engine.supports_dsa_index_lmcache = False
+    connector._lmcache_engine.wait_for_layerwise_prefill_load = MagicMock()
+    connector._lmcache_engine.save_layerwise_prefill_kv_layer = MagicMock()
+    assert connector.supports_layerwise_prefill_p_node is True
+    connector.wait_for_layerwise_prefill_load(callback)
+    connector.save_layerwise_prefill_kv_layer(
+        callback, kv_layer, attn_metadata, synchronous=True
+    )
+
+    wait.assert_called_once_with(callback)
+    save.assert_called_once_with(callback, kv_layer, attn_metadata, synchronous=True)
+
+
+def test_lmcache_rejects_incomplete_layerwise_prefill_callbacks():
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = SimpleNamespace(
+        supports_layerwise_prefill_eager_callbacks=True,
+        supports_dsa_index_lmcache=True,
+        wait_for_layerwise_prefill_load=lambda _: None,
+    )
+
+    with pytest.raises(RuntimeError, match="without both synchronous callbacks"):
+        connector._freeze_layerwise_prefill_capabilities()
 
 
 @pytest.fixture

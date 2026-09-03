@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    LayerwisePrefillCallbackMetadata,
 )
 from vllm.logger import init_logger
 from vllm.utils.func_utils import supports_kw
@@ -71,6 +72,38 @@ class LMCacheKVEvents(KVConnectorKVEvents):
 
 
 class LMCacheConnectorV1(KVConnectorBase_V1):
+    @property
+    def supports_layerwise_prefill_eager_callbacks(self) -> bool:
+        return self._supports_layerwise_prefill_eager_callbacks
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        return self._supports_dsa_index_lmcache
+
+    @property
+    def supports_layerwise_prefill_p_node(self) -> bool:
+        return self._supports_layerwise_prefill_p_node
+
+    def _freeze_layerwise_prefill_capabilities(self) -> None:
+        engine = self._lmcache_engine
+        eager_callbacks = (
+            getattr(engine, "supports_layerwise_prefill_eager_callbacks", False) is True
+        )
+        index_lmcache = getattr(engine, "supports_dsa_index_lmcache", False) is True
+        supports_p_node = eager_callbacks and index_lmcache
+        wait = getattr(engine, "wait_for_layerwise_prefill_load", None)
+        save = getattr(engine, "save_layerwise_prefill_kv_layer", None)
+        if supports_p_node and (not callable(wait) or not callable(save)):
+            raise RuntimeError(
+                "LMCache advertises layerwise-prefill P-node support without "
+                "both synchronous callbacks"
+            )
+        self._supports_layerwise_prefill_eager_callbacks = eager_callbacks
+        self._supports_dsa_index_lmcache = index_lmcache
+        self._supports_layerwise_prefill_p_node = supports_p_node
+        self._layerwise_prefill_wait = wait if supports_p_node else None
+        self._layerwise_prefill_save = save if supports_p_node else None
+
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """
@@ -127,6 +160,7 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 )
             self._lmcache_engine = cls(vllm_config, role, self)
 
+        self._freeze_layerwise_prefill_capabilities()
         self._kv_cache_events: LMCacheKVEvents | None = None
 
     # ==============================
@@ -178,6 +212,15 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         """
         self._lmcache_engine.wait_for_layer_load(layer_name)
 
+    def wait_for_layerwise_prefill_load(
+        self, metadata: LayerwisePrefillCallbackMetadata
+    ) -> None:
+        if self._layerwise_prefill_wait is None:
+            raise RuntimeError(
+                "LMCache does not support synchronous layerwise-prefill callbacks"
+            )
+        self._layerwise_prefill_wait(metadata)
+
     def save_kv_layer(
         self,
         layer_name: str,
@@ -200,6 +243,19 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
         self._lmcache_engine.save_kv_layer(
             layer_name, kv_layer, attn_metadata, **kwargs
         )
+
+    def save_layerwise_prefill_kv_layer(
+        self,
+        metadata: LayerwisePrefillCallbackMetadata,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs: Any,
+    ) -> None:
+        if self._layerwise_prefill_save is None:
+            raise RuntimeError(
+                "LMCache does not support synchronous layerwise-prefill callbacks"
+            )
+        self._layerwise_prefill_save(metadata, kv_layer, attn_metadata, **kwargs)
 
     def wait_for_save(self):
         """

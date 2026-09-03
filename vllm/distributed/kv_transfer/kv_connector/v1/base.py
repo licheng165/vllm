@@ -43,13 +43,16 @@ The class provides the following primitives:
 import enum
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
+from vllm.v1.core.dsa_shared_pool import MAX_ALLOCATION_GENERATION
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.kv_cache_interface import DSAExecutionRow, DSAKVRow
 from vllm.v1.outputs import KVConnectorOutput
 
 if TYPE_CHECKING:
@@ -79,6 +82,86 @@ CopyBlocksOp = Callable[
 ]
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class LayerwisePrefillCallbackMetadata:
+    """Canonical identity for one synchronous P-node row callback."""
+
+    execution: DSAExecutionRow
+    row: DSAKVRow
+    request_generations: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.execution, DSAExecutionRow):
+            raise TypeError("layerwise prefill execution must be a DSAExecutionRow")
+        if not isinstance(self.row, DSAKVRow):
+            raise TypeError("layerwise prefill row must be a DSAKVRow")
+        if (
+            not isinstance(self.execution.latent, DSAKVRow)
+            or self.execution.latent.execution_ordinal
+            != self.execution.execution_ordinal
+            or self.execution.latent.kv_group != 0
+            or self.execution.latent.row_ordinal < 0
+            or self.execution.latent.bank != self.execution.latent.row_ordinal % 2
+            or (
+                self.execution.indexer is not None
+                and (
+                    not isinstance(self.execution.indexer, DSAKVRow)
+                    or self.execution.indexer.execution_ordinal
+                    != self.execution.execution_ordinal
+                    or self.execution.indexer.kv_group != 1
+                    or self.execution.indexer.row_ordinal < 0
+                    or self.execution.indexer.bank
+                    != self.execution.indexer.row_ordinal % 2
+                )
+            )
+        ):
+            raise ValueError(
+                "layerwise prefill execution contains inconsistent canonical rows"
+            )
+        if self.row not in (self.execution.latent, self.execution.indexer):
+            raise ValueError("layerwise prefill row does not belong to execution")
+
+        try:
+            request_generations = tuple(
+                (request_id, generation)
+                for request_id, generation in self.request_generations
+            )
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "layerwise prefill request generations must contain "
+                "(request_id, generation) pairs"
+            ) from error
+        if any(
+            not isinstance(request_id, str) or not request_id
+            for request_id, _ in request_generations
+        ):
+            raise ValueError("layerwise prefill request IDs must be non-empty strings")
+        if any(
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or not 0 < generation <= MAX_ALLOCATION_GENERATION
+            for _, generation in request_generations
+        ):
+            raise ValueError(
+                "layerwise prefill allocation generations must be uint64 values"
+            )
+        request_ids = [request_id for request_id, _ in request_generations]
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("layerwise prefill request IDs must be unique")
+        object.__setattr__(self, "request_generations", request_generations)
+
+    @classmethod
+    def for_execution(
+        cls,
+        execution: DSAExecutionRow,
+        request_generations: tuple[tuple[str, int], ...],
+    ) -> tuple["LayerwisePrefillCallbackMetadata", ...]:
+        rows: tuple[DSAKVRow, ...] = (execution.latent,)
+        if execution.indexer is not None:
+            rows += (execution.indexer,)
+        return tuple(cls(execution, row, request_generations) for row in rows)
 
 
 class SupportsHMA(ABC):
@@ -179,6 +262,24 @@ class KVConnectorBase_V1(ABC):
         layers, which can speed up KV data transfers. Defaults to False.
         """
         return False
+
+    @property
+    def supports_layerwise_prefill_eager_callbacks(self) -> bool:
+        """Whether synchronous eager callbacks accept canonical DSA rows."""
+        return False
+
+    @property
+    def supports_dsa_index_lmcache(self) -> bool:
+        """Whether this connector persists the separate DSA index KV group."""
+        return False
+
+    @property
+    def supports_layerwise_prefill_p_node(self) -> bool:
+        """Whether one connector implements the complete Stage 3 protocol."""
+        return bool(
+            self.supports_layerwise_prefill_eager_callbacks
+            and self.supports_dsa_index_lmcache
+        )
 
     def __init__(
         self,
@@ -327,6 +428,12 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def wait_for_layerwise_prefill_load(
+        self, metadata: LayerwisePrefillCallbackMetadata
+    ) -> None:
+        """Synchronously make one canonical DSA row ready for eager execution."""
+        raise NotImplementedError
+
     @abstractmethod
     def save_kv_layer(
         self,
@@ -348,6 +455,16 @@ class KVConnectorBase_V1(ABC):
             **kwargs: additional arguments for the save operation.
         """
         pass
+
+    def save_layerwise_prefill_kv_layer(
+        self,
+        metadata: LayerwisePrefillCallbackMetadata,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs: Any,
+    ) -> None:
+        """Synchronously save one canonical DSA row after eager execution."""
+        raise NotImplementedError
 
     @abstractmethod
     def wait_for_save(self):

@@ -14,7 +14,10 @@ from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorRole
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorBase_V1
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorBase_V1,
+    LayerwisePrefillCallbackMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
     MultiConnector,
@@ -24,7 +27,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.multi_connector import (
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl_connector import (
     NixlKVConnectorStats,
 )
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    DSAExecutionRow,
+    DSAKVRow,
+    KVCacheConfig,
+)
 from vllm.v1.outputs import KVConnectorOutput, KVConnectorWorkerMetadata
 
 MODEL_NAME = "meta-llama/Llama-3.2-1B-Instruct"
@@ -798,6 +805,125 @@ def test_multi_connector_prefer_cross_layer_blocks(mc):
     mc._connectors[0].prefer_cross_layer_blocks = True
     mc._connectors[1].prefer_cross_layer_blocks = True
     assert mc.prefer_cross_layer_blocks is True
+
+
+@pytest.mark.skip_global_cleanup
+def test_layerwise_prefill_callback_metadata_omits_consumer_indexer():
+    latent = DSAKVRow("latent", 3, 0, 3, 1)
+    execution = DSAExecutionRow(3, latent, None)
+
+    callbacks = LayerwisePrefillCallbackMetadata.for_execution(execution, (("req", 9),))
+    callback = MagicMock()
+    for metadata in callbacks:
+        callback(metadata)
+
+    assert len(callbacks) == 1
+    callback.assert_called_once_with(callbacks[0])
+    assert callbacks[0].row is latent
+    assert callbacks[0].row.bank == 1
+    assert callbacks[0].request_generations == (("req", 9),)
+
+
+@pytest.mark.skip_global_cleanup
+def test_layerwise_prefill_callback_metadata_is_normalized_and_validated():
+    latent = DSAKVRow("latent", 3, 0, 3, 1)
+    execution = DSAExecutionRow(3, latent, None)
+    mutable_generations = [["req", 9]]
+
+    callback = LayerwisePrefillCallbackMetadata(
+        execution,
+        latent,
+        mutable_generations,  # type: ignore[arg-type]
+    )
+    mutable_generations[0][1] = 10
+
+    assert callback.request_generations == (("req", 9),)
+    with pytest.raises(ValueError, match="uint64"):
+        LayerwisePrefillCallbackMetadata(execution, latent, (("req", True),))
+    with pytest.raises(ValueError, match="uint64"):
+        LayerwisePrefillCallbackMetadata(execution, latent, (("req", 1 << 64),))
+    with pytest.raises(ValueError, match="inconsistent canonical rows"):
+        LayerwisePrefillCallbackMetadata(
+            DSAExecutionRow(4, latent, None), latent, (("req", 1),)
+        )
+    with pytest.raises(ValueError, match="inconsistent canonical rows"):
+        wrong_group = DSAKVRow("latent", 3, 1, 3, 1)
+        LayerwisePrefillCallbackMetadata(
+            DSAExecutionRow(3, wrong_group, None),
+            wrong_group,
+            (("req", 1),),
+        )
+
+
+@pytest.mark.skip_global_cleanup
+def test_multi_connector_delegates_complete_layerwise_prefill_capability(mc):
+    first, second = mc._connectors
+    first.supports_layerwise_prefill_eager_callbacks = True
+    first.supports_dsa_index_lmcache = False
+    first.supports_layerwise_prefill_p_node = False
+    second.supports_layerwise_prefill_eager_callbacks = False
+    second.supports_dsa_index_lmcache = True
+    second.supports_layerwise_prefill_p_node = False
+    mc._freeze_layerwise_prefill_capabilities()
+
+    assert mc.supports_layerwise_prefill_eager_callbacks is True
+    assert mc.supports_dsa_index_lmcache is True
+    assert mc.supports_layerwise_prefill_p_node is False
+    with pytest.raises(RuntimeError, match="At least one connector"):
+        mc.wait_for_layerwise_prefill_load(MagicMock())
+
+    first.supports_dsa_index_lmcache = True
+    first.supports_layerwise_prefill_p_node = True
+    assert mc.supports_layerwise_prefill_p_node is False
+
+    capable_mc = object.__new__(MultiConnector)
+    capable_mc._connectors = [first, second]
+    capable_mc._freeze_layerwise_prefill_capabilities()
+    frozen_wait = first.wait_for_layerwise_prefill_load
+    frozen_save = first.save_layerwise_prefill_kv_layer
+    latent = DSAKVRow("latent", 6, 0, 6, 0)
+    indexer = DSAKVRow("indexer", 6, 1, 3, 1)
+    callback = LayerwisePrefillCallbackMetadata(
+        DSAExecutionRow(6, latent, indexer), indexer, (("req", 17),)
+    )
+    kv_layer = object()
+    attn_metadata = object()
+
+    first.supports_layerwise_prefill_p_node = False
+    first.wait_for_layerwise_prefill_load = MagicMock()
+    first.save_layerwise_prefill_kv_layer = MagicMock()
+    capable_mc.wait_for_layerwise_prefill_load(callback)
+    capable_mc.save_layerwise_prefill_kv_layer(callback, kv_layer, attn_metadata)
+
+    frozen_wait.assert_called_once_with(callback)
+    frozen_save.assert_called_once_with(callback, kv_layer, attn_metadata)
+    second.wait_for_layerwise_prefill_load.assert_not_called()
+    second.save_layerwise_prefill_kv_layer.assert_not_called()
+
+
+@pytest.mark.skip_global_cleanup
+def test_multi_connector_rejects_inherited_layerwise_prefill_hooks():
+    child = MagicMock()
+    child.supports_layerwise_prefill_eager_callbacks = True
+    child.supports_dsa_index_lmcache = True
+    child.supports_layerwise_prefill_p_node = True
+    child.wait_for_layerwise_prefill_load = (
+        KVConnectorBase_V1.wait_for_layerwise_prefill_load.__get__(
+            child,
+            KVConnectorBase_V1,
+        )
+    )
+    child.save_layerwise_prefill_kv_layer = (
+        KVConnectorBase_V1.save_layerwise_prefill_kv_layer.__get__(
+            child,
+            KVConnectorBase_V1,
+        )
+    )
+    connector = object.__new__(MultiConnector)
+    connector._connectors = [child]
+
+    with pytest.raises(RuntimeError, match="without both synchronous callbacks"):
+        connector._freeze_layerwise_prefill_capabilities()
 
 
 def test_multi_connector_worker_metadata(mc):
