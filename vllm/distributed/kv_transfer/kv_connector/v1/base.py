@@ -281,6 +281,19 @@ class KVConnectorBase_V1(ABC):
             and self.supports_dsa_index_lmcache
         )
 
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        """Whether the connector splits row saves around the HCOM window.
+
+        Stage 4 protocol: connectors advertising this capability must keep the
+        Stage 3 synchronous contract disabled on the P-node path and instead
+        receive ``submit_layerwise_prefill_save`` before the projection/
+        all-reduce window, ``submit_layerwise_prefill_load`` for the next row
+        of each present group in the same window, and
+        ``finish_layerwise_prefill_save`` after the window closes.
+        """
+        return False
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -464,6 +477,40 @@ class KVConnectorBase_V1(ABC):
         **kwargs: Any,
     ) -> None:
         """Synchronously save one canonical DSA row after eager execution."""
+        raise NotImplementedError
+
+    def submit_layerwise_prefill_save(
+        self,
+        metadata: LayerwisePrefillCallbackMetadata,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs: Any,
+    ) -> None:
+        """Enqueue one canonical DSA row D2H save inside the transfer window.
+
+        Only device-side work may be submitted here; the call must return
+        without host-side blocking so the projection/all-reduce window is not
+        stalled. Host-side publication happens later in
+        ``finish_layerwise_prefill_save``.
+        """
+        raise NotImplementedError
+
+    def submit_layerwise_prefill_load(
+        self, metadata: LayerwisePrefillCallbackMetadata
+    ) -> None:
+        """Enqueue the next row load for the metadata's groups (pre-HCOM).
+
+        The connector derives the per-group next row from its own cursors;
+        callers pass the metadata of the execution that just finished. The
+        submission must wait for the target bank's old source-done event
+        before overwriting it.
+        """
+        raise NotImplementedError
+
+    def finish_layerwise_prefill_save(
+        self, metadata: LayerwisePrefillCallbackMetadata
+    ) -> None:
+        """Publish one submitted row save after the HCOM window closed."""
         raise NotImplementedError
 
     @abstractmethod

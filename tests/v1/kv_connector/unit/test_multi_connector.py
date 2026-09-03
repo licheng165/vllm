@@ -926,6 +926,106 @@ def test_multi_connector_rejects_inherited_layerwise_prefill_hooks():
         connector._freeze_layerwise_prefill_capabilities()
 
 
+@pytest.mark.skip_global_cleanup
+def test_multi_connector_delegates_frozen_transfer_window(mc):
+    first, second = mc._connectors
+    for child in (first, second):
+        child.supports_layerwise_prefill_eager_callbacks = True
+        child.supports_dsa_index_lmcache = True
+        child.supports_layerwise_prefill_p_node = True
+    first.supports_layerwise_prefill_transfer_window = True
+    second.supports_layerwise_prefill_transfer_window = False
+    capable_mc = object.__new__(MultiConnector)
+    capable_mc._connectors = [first, second]
+    capable_mc._freeze_layerwise_prefill_capabilities()
+    frozen_submit_save = first.submit_layerwise_prefill_save
+    frozen_submit_load = first.submit_layerwise_prefill_load
+    frozen_finish_save = first.finish_layerwise_prefill_save
+    latent = DSAKVRow("latent", 6, 0, 6, 0)
+    indexer = DSAKVRow("indexer", 6, 1, 3, 1)
+    callback = LayerwisePrefillCallbackMetadata(
+        DSAExecutionRow(6, latent, indexer), indexer, (("req", 17),)
+    )
+    kv_layer = object()
+    attn_metadata = object()
+
+    assert capable_mc.supports_layerwise_prefill_transfer_window is True
+    first.supports_layerwise_prefill_transfer_window = False
+    first.submit_layerwise_prefill_save = MagicMock()
+    first.submit_layerwise_prefill_load = MagicMock()
+    first.finish_layerwise_prefill_save = MagicMock()
+    assert capable_mc.supports_layerwise_prefill_transfer_window is True
+    capable_mc.submit_layerwise_prefill_save(callback, kv_layer, attn_metadata)
+    capable_mc.submit_layerwise_prefill_load(callback)
+    capable_mc.finish_layerwise_prefill_save(callback)
+
+    frozen_submit_save.assert_called_once_with(callback, kv_layer, attn_metadata)
+    frozen_submit_load.assert_called_once_with(callback)
+    frozen_finish_save.assert_called_once_with(callback)
+    second.submit_layerwise_prefill_save.assert_not_called()
+    second.submit_layerwise_prefill_load.assert_not_called()
+    second.finish_layerwise_prefill_save.assert_not_called()
+
+    bare_mc = object.__new__(MultiConnector)
+    bare_mc._connectors = [first, second]
+    bare_mc._freeze_layerwise_prefill_capabilities()
+    with pytest.raises(RuntimeError, match="transfer window"):
+        bare_mc.submit_layerwise_prefill_load(MagicMock())
+
+
+@pytest.mark.skip_global_cleanup
+def test_multi_connector_rejects_inherited_transfer_window_hooks():
+    child = MagicMock()
+    child.supports_layerwise_prefill_eager_callbacks = True
+    child.supports_dsa_index_lmcache = True
+    child.supports_layerwise_prefill_p_node = True
+    child.supports_layerwise_prefill_transfer_window = True
+    child.submit_layerwise_prefill_save = (
+        KVConnectorBase_V1.submit_layerwise_prefill_save.__get__(
+            child,
+            KVConnectorBase_V1,
+        )
+    )
+    child.submit_layerwise_prefill_load = (
+        KVConnectorBase_V1.submit_layerwise_prefill_load.__get__(
+            child,
+            KVConnectorBase_V1,
+        )
+    )
+    child.finish_layerwise_prefill_save = (
+        KVConnectorBase_V1.finish_layerwise_prefill_save.__get__(
+            child,
+            KVConnectorBase_V1,
+        )
+    )
+    connector = object.__new__(MultiConnector)
+    connector._connectors = [child]
+
+    with pytest.raises(RuntimeError, match="without all three window callbacks"):
+        connector._freeze_layerwise_prefill_capabilities()
+
+
+@pytest.mark.skip_global_cleanup
+def test_multi_connector_rejects_window_without_p_node_contract():
+    child = MagicMock()
+    child.supports_layerwise_prefill_eager_callbacks = True
+    child.supports_dsa_index_lmcache = True
+    child.supports_layerwise_prefill_p_node = True
+    child.supports_layerwise_prefill_transfer_window = True
+    connector = object.__new__(MultiConnector)
+    connector._connectors = [child]
+    connector._freeze_layerwise_prefill_capabilities()
+
+    child.supports_layerwise_prefill_p_node = False
+    partial_mc = object.__new__(MultiConnector)
+    partial_mc._connectors = [child]
+    partial_mc._freeze_layerwise_prefill_capabilities()
+
+    assert partial_mc.supports_layerwise_prefill_transfer_window is False
+    with pytest.raises(RuntimeError, match="transfer window"):
+        partial_mc.submit_layerwise_prefill_load(MagicMock())
+
+
 def test_multi_connector_worker_metadata(mc):
     class MockConnectorWorkerMetadata(KVConnectorWorkerMetadata):
         def __init__(self, data: set[str]):

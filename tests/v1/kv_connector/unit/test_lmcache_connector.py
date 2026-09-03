@@ -193,6 +193,85 @@ def test_lmcache_rejects_incomplete_layerwise_prefill_callbacks():
         connector._freeze_layerwise_prefill_capabilities()
 
 
+def test_lmcache_delegates_layerwise_prefill_transfer_window():
+    submit_save = MagicMock()
+    submit_load = MagicMock()
+    finish_save = MagicMock()
+    wait = MagicMock()
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = SimpleNamespace(
+        supports_layerwise_prefill_eager_callbacks=True,
+        supports_dsa_index_lmcache=True,
+        supports_layerwise_prefill_transfer_window=True,
+        wait_for_layerwise_prefill_load=wait,
+        save_layerwise_prefill_kv_layer=MagicMock(),
+        submit_layerwise_prefill_save=submit_save,
+        submit_layerwise_prefill_load=submit_load,
+        finish_layerwise_prefill_save=finish_save,
+    )
+    connector._freeze_layerwise_prefill_capabilities()
+    latent = DSAKVRow("latent", 6, 0, 6, 0)
+    indexer = DSAKVRow("indexer", 6, 1, 3, 1)
+    callback = LayerwisePrefillCallbackMetadata(
+        DSAExecutionRow(6, latent, indexer), indexer, (("req", 23),)
+    )
+    kv_layer = object()
+    attn_metadata = object()
+
+    assert connector.supports_layerwise_prefill_transfer_window is True
+    connector._lmcache_engine.supports_layerwise_prefill_transfer_window = False
+    connector._lmcache_engine.submit_layerwise_prefill_save = MagicMock()
+    connector._lmcache_engine.submit_layerwise_prefill_load = MagicMock()
+    connector._lmcache_engine.finish_layerwise_prefill_save = MagicMock()
+    assert connector.supports_layerwise_prefill_transfer_window is True
+    connector.submit_layerwise_prefill_save(callback, kv_layer, attn_metadata)
+    connector.submit_layerwise_prefill_load(callback)
+    connector.finish_layerwise_prefill_save(callback)
+
+    submit_save.assert_called_once_with(callback, kv_layer, attn_metadata)
+    submit_load.assert_called_once_with(callback)
+    finish_save.assert_called_once_with(callback)
+
+
+def test_lmcache_transfer_window_requires_all_three_callbacks():
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = SimpleNamespace(
+        supports_layerwise_prefill_eager_callbacks=True,
+        supports_dsa_index_lmcache=True,
+        supports_layerwise_prefill_transfer_window=True,
+        wait_for_layerwise_prefill_load=lambda _: None,
+        save_layerwise_prefill_kv_layer=lambda *_: None,
+        submit_layerwise_prefill_save=lambda *_: None,
+        submit_layerwise_prefill_load=lambda _: None,
+    )
+
+    with pytest.raises(RuntimeError, match="without all three window callbacks"):
+        connector._freeze_layerwise_prefill_capabilities()
+
+
+def test_lmcache_without_transfer_window_rejects_window_calls():
+    connector = object.__new__(LMCacheConnectorV1)
+    connector._lmcache_engine = SimpleNamespace(
+        supports_layerwise_prefill_eager_callbacks=True,
+        supports_dsa_index_lmcache=True,
+        wait_for_layerwise_prefill_load=lambda _: None,
+        save_layerwise_prefill_kv_layer=lambda *_: None,
+    )
+    connector._freeze_layerwise_prefill_capabilities()
+    latent = DSAKVRow("latent", 3, 0, 3, 1)
+    callback = LayerwisePrefillCallbackMetadata(
+        DSAExecutionRow(3, latent, None), latent, (("req", 9),)
+    )
+
+    assert connector.supports_layerwise_prefill_transfer_window is False
+    with pytest.raises(RuntimeError, match="transfer window"):
+        connector.submit_layerwise_prefill_save(callback, object(), object())
+    with pytest.raises(RuntimeError, match="transfer window"):
+        connector.submit_layerwise_prefill_load(callback)
+    with pytest.raises(RuntimeError, match="transfer window"):
+        connector.finish_layerwise_prefill_save(callback)
+
+
 @pytest.fixture
 def mock_lmcache_engine_event():
     """Create a mock event object that mimics what the lmcache engine returns."""

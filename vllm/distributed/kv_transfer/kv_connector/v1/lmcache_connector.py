@@ -84,6 +84,10 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
     def supports_layerwise_prefill_p_node(self) -> bool:
         return self._supports_layerwise_prefill_p_node
 
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        return self._supports_layerwise_prefill_transfer_window
+
     def _freeze_layerwise_prefill_capabilities(self) -> None:
         engine = self._lmcache_engine
         eager_callbacks = (
@@ -98,11 +102,36 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 "LMCache advertises layerwise-prefill P-node support without "
                 "both synchronous callbacks"
             )
+        transfer_window = (
+            supports_p_node
+            and getattr(
+                engine,
+                "supports_layerwise_prefill_transfer_window",
+                False,
+            )
+            is True
+        )
+        submit_save = getattr(engine, "submit_layerwise_prefill_save", None)
+        submit_load = getattr(engine, "submit_layerwise_prefill_load", None)
+        finish_save = getattr(engine, "finish_layerwise_prefill_save", None)
+        if transfer_window and (
+            not callable(submit_save)
+            or not callable(submit_load)
+            or not callable(finish_save)
+        ):
+            raise RuntimeError(
+                "LMCache advertises the layerwise-prefill transfer window "
+                "without all three window callbacks"
+            )
         self._supports_layerwise_prefill_eager_callbacks = eager_callbacks
         self._supports_dsa_index_lmcache = index_lmcache
         self._supports_layerwise_prefill_p_node = supports_p_node
+        self._supports_layerwise_prefill_transfer_window = transfer_window
         self._layerwise_prefill_wait = wait if supports_p_node else None
         self._layerwise_prefill_save = save if supports_p_node else None
+        self._layerwise_prefill_submit_save = submit_save if transfer_window else None
+        self._layerwise_prefill_submit_load = submit_load if transfer_window else None
+        self._layerwise_prefill_finish_save = finish_save if transfer_window else None
 
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
@@ -256,6 +285,37 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
                 "LMCache does not support synchronous layerwise-prefill callbacks"
             )
         self._layerwise_prefill_save(metadata, kv_layer, attn_metadata, **kwargs)
+
+    def submit_layerwise_prefill_save(
+        self,
+        metadata: LayerwisePrefillCallbackMetadata,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs: Any,
+    ) -> None:
+        if self._layerwise_prefill_submit_save is None:
+            raise RuntimeError(
+                "LMCache does not support the layerwise-prefill transfer window"
+            )
+        self._layerwise_prefill_submit_save(metadata, kv_layer, attn_metadata, **kwargs)
+
+    def submit_layerwise_prefill_load(
+        self, metadata: LayerwisePrefillCallbackMetadata
+    ) -> None:
+        if self._layerwise_prefill_submit_load is None:
+            raise RuntimeError(
+                "LMCache does not support the layerwise-prefill transfer window"
+            )
+        self._layerwise_prefill_submit_load(metadata)
+
+    def finish_layerwise_prefill_save(
+        self, metadata: LayerwisePrefillCallbackMetadata
+    ) -> None:
+        if self._layerwise_prefill_finish_save is None:
+            raise RuntimeError(
+                "LMCache does not support the layerwise-prefill transfer window"
+            )
+        self._layerwise_prefill_finish_save(metadata)
 
     def wait_for_save(self):
         """

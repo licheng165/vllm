@@ -196,8 +196,13 @@ class MultiConnector(KVConnectorBase_V1):
     def supports_layerwise_prefill_p_node(self) -> bool:
         return bool(self._layerwise_prefill_callbacks)
 
+    @property
+    def supports_layerwise_prefill_transfer_window(self) -> bool:
+        return bool(self._layerwise_prefill_transfer_window_callbacks)
+
     def _freeze_layerwise_prefill_capabilities(self) -> None:
         callbacks = []
+        transfer_window_callbacks = []
         for connector in self._connectors:
             if connector.supports_layerwise_prefill_p_node is not True:
                 continue
@@ -224,6 +229,28 @@ class MultiConnector(KVConnectorBase_V1):
                     "support without both synchronous callbacks"
                 )
             callbacks.append((wait, save))
+            if connector.supports_layerwise_prefill_transfer_window is True:
+                submit_save = getattr(connector, "submit_layerwise_prefill_save", None)
+                submit_load = getattr(connector, "submit_layerwise_prefill_load", None)
+                finish_save = getattr(connector, "finish_layerwise_prefill_save", None)
+                if (
+                    not callable(submit_save)
+                    or not callable(submit_load)
+                    or not callable(finish_save)
+                    or getattr(submit_save, "__func__", None)
+                    is KVConnectorBase_V1.submit_layerwise_prefill_save
+                    or getattr(submit_load, "__func__", None)
+                    is KVConnectorBase_V1.submit_layerwise_prefill_load
+                    or getattr(finish_save, "__func__", None)
+                    is KVConnectorBase_V1.finish_layerwise_prefill_save
+                ):
+                    raise RuntimeError(
+                        "A child connector advertises the layerwise-prefill "
+                        "transfer window without all three window callbacks"
+                    )
+                transfer_window_callbacks.append(
+                    (submit_save, submit_load, finish_save)
+                )
         self._supports_layerwise_prefill_eager_callbacks = any(
             connector.supports_layerwise_prefill_eager_callbacks is True
             for connector in self._connectors
@@ -235,6 +262,9 @@ class MultiConnector(KVConnectorBase_V1):
         # Component capabilities on different children cannot jointly provide
         # the per-row bank protocol.
         self._layerwise_prefill_callbacks = tuple(callbacks)
+        self._layerwise_prefill_transfer_window_callbacks = tuple(
+            transfer_window_callbacks
+        )
 
     @classmethod
     def _get_connector_classes_and_configs(
@@ -352,6 +382,43 @@ class MultiConnector(KVConnectorBase_V1):
             )
         for _, save in self._layerwise_prefill_callbacks:
             save(metadata, kv_layer, attn_metadata, **kwargs)
+
+    def submit_layerwise_prefill_save(
+        self,
+        metadata: LayerwisePrefillCallbackMetadata,
+        kv_layer: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        **kwargs,
+    ) -> None:
+        if not self._layerwise_prefill_transfer_window_callbacks:
+            raise RuntimeError(
+                "At least one connector must support the layerwise-prefill "
+                "transfer window"
+            )
+        for submit_save, _, _ in self._layerwise_prefill_transfer_window_callbacks:
+            submit_save(metadata, kv_layer, attn_metadata, **kwargs)
+
+    def submit_layerwise_prefill_load(
+        self, metadata: LayerwisePrefillCallbackMetadata
+    ) -> None:
+        if not self._layerwise_prefill_transfer_window_callbacks:
+            raise RuntimeError(
+                "At least one connector must support the layerwise-prefill "
+                "transfer window"
+            )
+        for _, submit_load, _ in self._layerwise_prefill_transfer_window_callbacks:
+            submit_load(metadata)
+
+    def finish_layerwise_prefill_save(
+        self, metadata: LayerwisePrefillCallbackMetadata
+    ) -> None:
+        if not self._layerwise_prefill_transfer_window_callbacks:
+            raise RuntimeError(
+                "At least one connector must support the layerwise-prefill "
+                "transfer window"
+            )
+        for _, _, finish_save in self._layerwise_prefill_transfer_window_callbacks:
+            finish_save(metadata)
 
     def wait_for_save(self):
         for c in self._connectors:
