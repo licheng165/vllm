@@ -1129,6 +1129,52 @@ def get_layerwise_prefill_max_tokens(kv_cache_config: KVCacheConfig) -> int:
     return low
 
 
+def layerwise_prefill_startup_summary(
+    kv_cache_config: KVCacheConfig,
+) -> dict[str, Any]:
+    """Observability snapshot for the P-node startup log.
+
+    One pure helper produces the design's §13.1 fields so the startup log,
+    capacity report, and tests cannot drift apart.
+    """
+    topology = kv_cache_config.dsa_kv_topology
+    if topology is None:
+        raise ValueError("layerwise prefill summary requires DSA KV topology")
+    latent_group, indexer_group = get_dsa_role_groups(
+        kv_cache_config.kv_cache_groups, topology
+    )
+    latent_page = latent_group.kv_cache_spec.page_size_bytes
+    indexer_page = indexer_group.kv_cache_spec.page_size_bytes
+    bundle_page = lcm(latent_page, indexer_page)
+    producer_executions = [
+        execution.execution_ordinal
+        for execution in topology.executions
+        if execution.indexer is not None
+    ]
+    if len(kv_cache_config.kv_cache_tensors) != 1:
+        raise ValueError(
+            "layerwise prefill summary expects exactly one global raw tensor"
+        )
+    return {
+        "residency_mode": "PREFILL_LAYERWISE",
+        "topology_signature": topology.signature,
+        "latent_layers": len(topology.rows_by_group[0]),
+        "indexer_layers": len(topology.rows_by_group[1]),
+        "producer_execution_count": len(producer_executions),
+        "latent_page_bytes": latent_page,
+        "indexer_page_bytes": indexer_page,
+        "bundle_page_bytes": bundle_page,
+        "latent_blocks_per_bundle": bundle_page // latent_page,
+        "indexer_blocks_per_bundle": bundle_page // indexer_page,
+        "parent_capacity": kv_cache_config.num_blocks,
+        "child_capacity": (
+            len(topology.rows_by_group[0]) * kv_cache_config.num_blocks
+        ),
+        "slab_bytes": kv_cache_config.kv_cache_tensors[0].size,
+        "max_tokens": get_layerwise_prefill_max_tokens(kv_cache_config),
+    }
+
+
 def get_max_concurrency_for_kv_cache_config(
     vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
 ) -> float:
@@ -1722,6 +1768,30 @@ def get_kv_cache_config_from_groups(
                     slab_size,
                     slab_size / 2**30,
                     get_layerwise_prefill_max_tokens(kv_cache_config),
+                )
+                summary = layerwise_prefill_startup_summary(kv_cache_config)
+                logger.info(
+                    "Layerwise-prefill P node: residency_mode=%s "
+                    "topology_signature=%s latent_layers=%d indexer_layers=%d "
+                    "producer_executions=%d latent_page_bytes=%d "
+                    "indexer_page_bytes=%d bundle_page_bytes=%d "
+                    "latent_blocks_per_bundle=%d indexer_blocks_per_bundle=%d "
+                    "parent_capacity=%d child_capacity=%d slab_bytes=%d "
+                    "max_tokens=%d.",
+                    summary["residency_mode"],
+                    summary["topology_signature"],
+                    summary["latent_layers"],
+                    summary["indexer_layers"],
+                    summary["producer_execution_count"],
+                    summary["latent_page_bytes"],
+                    summary["indexer_page_bytes"],
+                    summary["bundle_page_bytes"],
+                    summary["latent_blocks_per_bundle"],
+                    summary["indexer_blocks_per_bundle"],
+                    summary["parent_capacity"],
+                    summary["child_capacity"],
+                    summary["slab_bytes"],
+                    summary["max_tokens"],
                 )
                 return kv_cache_config
 

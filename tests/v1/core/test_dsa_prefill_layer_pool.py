@@ -23,6 +23,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
     get_kv_cache_configs,
     get_layerwise_prefill_max_tokens,
+    layerwise_prefill_startup_summary,
 )
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -45,6 +46,8 @@ from vllm.v1.worker.gpu_model_runner import (
 pytestmark = [pytest.mark.cpu_test, pytest.mark.skip_global_cleanup]
 
 _BUNDLE_PAGE_BYTES = 294_912
+_LATENT_PAGE_BYTES = 147_456
+_INDEXER_PAGE_BYTES = 32_768
 _GLM52_INDEXER_EXECUTIONS = (
     0,
     1,
@@ -393,6 +396,20 @@ def test_global_slab_capacity_boundaries_and_reconciliation(monkeypatch):
     assert tensor.size == (79 * 138 + 1) * _BUNDLE_PAGE_BYTES
     assert tensor.size / 2**30 == pytest.approx(2.995, abs=0.001)
     assert get_layerwise_prefill_max_tokens(config_138) == 1_141_632
+
+    summary = layerwise_prefill_startup_summary(config_138)
+    assert summary["residency_mode"] == "PREFILL_LAYERWISE"
+    assert summary["topology_signature"]
+    assert summary["latent_layers"] == 79
+    assert summary["indexer_layers"] == 22
+    assert summary["producer_execution_count"] == 22
+    assert summary["latent_page_bytes"] == _LATENT_PAGE_BYTES
+    assert summary["indexer_page_bytes"] == _INDEXER_PAGE_BYTES
+    assert summary["bundle_page_bytes"] == _BUNDLE_PAGE_BYTES
+    assert summary["parent_capacity"] == 138
+    assert summary["child_capacity"] == 79 * 138
+    assert summary["slab_bytes"] == (79 * 138 + 1) * _BUNDLE_PAGE_BYTES
+    assert summary["max_tokens"] == 1_141_632
 
     vllm_config = _vllm_config(1)
     vllm_config.cache_config.num_gpu_blocks_override = None
