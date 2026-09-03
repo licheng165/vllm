@@ -1604,6 +1604,7 @@ def get_kv_cache_config_from_groups(
     kv_cache_groups: list[KVCacheGroupSpec],
     available_memory: int,
     dsa_kv_topology: DSAKVTopology | None = None,
+    for_minimal_profile: bool = False,
 ) -> KVCacheConfig:
     """
     Generate the KV cache configuration from the KV cache groups and spec
@@ -1614,6 +1615,10 @@ def get_kv_cache_config_from_groups(
         kv_cache_groups: The KV cache groups
         available_memory: Memory available for KV cache in bytes
         dsa_kv_topology: Canonical global DSA topology, when enabled
+        for_minimal_profile: True only for the throwaway minimal config
+            used to profile graph memory; one-max-length-request
+            admission gates are skipped because the block override is
+            temporarily clamped to the capture size.
     Returns:
         The generated KVCacheConfig
     """
@@ -1735,7 +1740,10 @@ def get_kv_cache_config_from_groups(
                     indexer_group,
                 )
                 child_capacity = num_physical_slots * parent_capacity
-                if required_children > child_capacity:
+                if (
+                    required_children > child_capacity
+                    and not for_minimal_profile
+                ):
                     raise ValueError(
                         "Layerwise-prefill parent capacity cannot hold one "
                         f"max-length request: C={parent_capacity}, "
@@ -1744,7 +1752,7 @@ def get_kv_cache_config_from_groups(
                         f"{vllm_config.model_config.max_model_len}."
                     )
                 slab_size = (child_capacity + 1) * bundle_page
-                if slab_size > available_memory:
+                if slab_size > available_memory and not for_minimal_profile:
                     raise ValueError(
                         "Layerwise-prefill global slab exceeds available KV "
                         f"memory: required={slab_size}, "
@@ -1899,7 +1907,7 @@ def get_kv_cache_config_from_groups(
                         "DSA sparse decode D node requires index_topk and "
                         "nonzero scratch bundles."
                     )
-                if sparse_decode_capacity < 1:
+                if sparse_decode_capacity < 1 and not for_minimal_profile:
                     raise ValueError(
                         "DSA sparse decode D node pool cannot hold one "
                         f"max-length request: bundles={num_bundles}, "

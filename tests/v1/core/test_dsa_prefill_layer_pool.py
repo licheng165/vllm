@@ -487,6 +487,60 @@ def test_d_node_rejects_pools_smaller_than_one_max_length_request(monkeypatch):
     assert config.num_blocks == 885
 
 
+def test_minimal_profiling_config_skips_admission_gates(monkeypatch):
+    groups, topology, _ = _glm52_groups_and_topology()
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "true")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_UNBUNDLE", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "2")
+    vllm_config = _vllm_config(64, max_model_len=1_000_000)
+    vllm_config.num_speculative_tokens = 1
+
+    # The real pool still enforces one-max-length-request admission even
+    # with a clamped block override and zero measured memory.
+    with pytest.raises(ValueError, match="cannot hold one max-length request"):
+        get_kv_cache_config_from_groups(
+            vllm_config,
+            groups,
+            available_memory=0,
+            dsa_kv_topology=topology,
+        )
+
+    # The throwaway minimal config used for graph-memory profiling skips
+    # the admission gate; the real config re-validates after profiling.
+    minimal = get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=0,
+        dsa_kv_topology=topology,
+        for_minimal_profile=True,
+    )
+    assert minimal.num_blocks == 64
+
+    # The P-node slab admission gates follow the same rule.
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "false")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")
+    p_vllm_config = _vllm_config(1, max_model_len=1_000_000)
+    with pytest.raises(ValueError, match="cannot hold one max-length request"):
+        get_kv_cache_config_from_groups(
+            p_vllm_config,
+            groups,
+            available_memory=0,
+            dsa_kv_topology=topology,
+        )
+    p_minimal = get_kv_cache_config_from_groups(
+        p_vllm_config,
+        groups,
+        available_memory=0,
+        dsa_kv_topology=topology,
+        for_minimal_profile=True,
+    )
+    assert p_minimal.num_blocks == 1
+
+
 def test_node_modes_are_mutually_exclusive_and_validated(monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
     monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "true")

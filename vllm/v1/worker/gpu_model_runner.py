@@ -5867,7 +5867,10 @@ class GPUModelRunner(
         saved_override = self.cache_config.num_gpu_blocks_override
         self.cache_config.num_gpu_blocks_override = min_blocks
         minimal_config = get_kv_cache_config_from_groups(
-            self.vllm_config, kv_cache_groups, available_memory=0
+            self.vllm_config,
+            kv_cache_groups,
+            available_memory=0,
+            for_minimal_profile=True,
         )
         self.cache_config.num_gpu_blocks_override = saved_override
 
