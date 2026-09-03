@@ -17,6 +17,23 @@ from vllm.utils.torch_utils import get_dtype_size
 logger = init_logger(__name__)
 
 
+def layerwise_prefill_p_node_enabled() -> bool:
+    """Whether this process is explicitly configured as a layerwise P node."""
+    raw = os.getenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(
+        f"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE must be 'true' or 'false', got {raw!r}"
+    )
+
+
+def dsa_unbundle_enabled() -> bool:
+    return os.getenv("VLLM_ASCEND_DSA_UNBUNDLE", "0") == "1"
+
+
 def dsa_two_groups_enabled() -> bool:
     """vllm-ascend DSA un-bundled latent/indexer (two-group mode).
 
@@ -45,6 +62,42 @@ def dsa_shrink_stage() -> int:
         return int(os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0"))
     except ValueError:
         return 0
+
+
+def validate_layerwise_prefill_p_node(
+    vllm_config: VllmConfig,
+    topology: "DSAKVTopology | None",
+) -> None:
+    """Validate the closed set of prerequisites for the P-node allocator."""
+    if not layerwise_prefill_p_node_enabled():
+        return
+
+    failures: list[str] = []
+    if not dsa_unbundle_enabled():
+        failures.append("VLLM_ASCEND_DSA_UNBUNDLE=1")
+    if not dsa_two_groups_enabled():
+        failures.append("VLLM_ASCEND_DSA_TWO_GROUPS=1")
+    if os.getenv("VLLM_ASCEND_DSA_SHARED_POOL") != "1":
+        failures.append("VLLM_ASCEND_DSA_SHARED_POOL=1")
+    if os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0") != "0":
+        failures.append("VLLM_ASCEND_DSA_SHRINK_LATENT=0")
+
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.pipeline_parallel_size != 1:
+        failures.append("pipeline_parallel_size=1")
+    if parallel_config.prefill_context_parallel_size != 1:
+        failures.append("prefill_context_parallel_size=1")
+    if parallel_config.decode_context_parallel_size != 1:
+        failures.append("decode_context_parallel_size=1")
+    if vllm_config.cache_config.enable_prefix_caching:
+        failures.append("enable_prefix_caching=false")
+    if topology is None:
+        failures.append("canonical DSA KV topology")
+
+    if failures:
+        raise ValueError(
+            "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=true requires: " + ", ".join(failures)
+        )
 
 
 @dataclass(frozen=True)

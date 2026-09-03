@@ -8,6 +8,7 @@ from typing import Literal, overload
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
@@ -78,6 +79,82 @@ class KVCacheBlocks:
         if allow_none and all(len(group) == 0 for group in self.blocks):
             return None
         return tuple([blk.block_id for blk in group] for group in self.blocks)
+
+    def get_block_ids_by_bank(
+        self,
+        *,
+        allow_none: bool = False,
+    ) -> tuple[tuple[list[int], ...], ...] | None:
+        """Return PREFILL_CHILD physical IDs, bank-major then group-major."""
+        if self.get_allocation_mode() != DSABlockAllocationMode.PREFILL_CHILD:
+            return None
+        bank_count: int | None = None
+        for group in self.blocks:
+            for block in group:
+                if block.is_null:
+                    continue
+                if block.bank_block_ids is None:
+                    raise ValueError("PREFILL_CHILD block is missing bank identities")
+                if bank_count is None:
+                    bank_count = len(block.bank_block_ids)
+                elif bank_count != len(block.bank_block_ids):
+                    raise ValueError("KV allocation contains inconsistent bank counts")
+        if bank_count is None or (allow_none and not any(self.blocks)):
+            return None
+
+        result: list[tuple[list[int], ...]] = []
+        for bank in range(bank_count):
+            bank_groups: list[list[int]] = []
+            for group in self.blocks:
+                ids: list[int] = []
+                for block in group:
+                    if block.is_null:
+                        ids.append(0)
+                    elif block.bank_block_ids is None:
+                        raise ValueError(
+                            "PREFILL_CHILD block is missing bank identities"
+                        )
+                    else:
+                        ids.append(block.bank_block_ids[bank])
+                bank_groups.append(ids)
+            result.append(tuple(bank_groups))
+        return tuple(result)
+
+    def get_allocation_mode(self) -> DSABlockAllocationMode | None:
+        modes = {
+            block.allocation_mode
+            for group in self.blocks
+            for block in group
+            if not block.is_null
+        }
+        if not modes:
+            return None
+        if None in modes:
+            if len(modes) != 1:
+                raise ValueError("KV allocation mixes typed and untyped blocks")
+            return None
+        if len(modes) != 1:
+            raise ValueError("KV allocation contains mixed allocation modes")
+        mode = next(iter(modes))
+        assert mode is not None
+        return mode
+
+    def get_allocation_generation(self) -> int | None:
+        if self.get_allocation_mode() != DSABlockAllocationMode.PREFILL_CHILD:
+            return None
+        generations = {
+            block.allocation_generation
+            for group in self.blocks
+            for block in group
+            if not block.is_null
+        }
+        if not generations:
+            return None
+        if None in generations or len(generations) != 1:
+            raise ValueError("KV allocation has missing or mixed generations")
+        generation = next(iter(generations))
+        assert generation is not None
+        return generation
 
     def get_unhashed_block_ids(self) -> list[int]:
         """Get block_ids of unhashed blocks from KVCacheBlocks instance."""
@@ -227,6 +304,7 @@ class KVCacheManager:
         delay_cache_blocks: bool = False,
         num_encoder_tokens: int = 0,
         dsa_compact_external_load: bool = False,
+        allocation_generation: int | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -373,6 +451,7 @@ class KVCacheManager:
             num_tokens_main_model,
             num_encoder_tokens,
             dsa_compact_external_load,
+            allocation_generation,
         )
 
         # P/D: delay caching blocks if we have to recv from

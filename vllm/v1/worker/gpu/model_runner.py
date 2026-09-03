@@ -43,7 +43,10 @@ from vllm.tasks import SupportedTask
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    layerwise_prefill_p_node_enabled,
+)
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
@@ -111,6 +114,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self.layerwise_prefill_p_node = layerwise_prefill_p_node_enabled()
 
         self.device = device
         self.dtype = self.model_config.dtype
@@ -879,6 +883,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if getattr(self, "layerwise_prefill_p_node", False):
+            raise RuntimeError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE allocator metadata is "
+                "enabled, but Stage 3 worker data-plane consumption is not "
+                "implemented; refusing execution before worker state update."
+            )
         if not dummy_run:
             # Update the request states.
             self.finish_requests(scheduler_output)

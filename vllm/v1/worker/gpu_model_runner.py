@@ -126,6 +126,11 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.core.dsa_shared_pool import (
+    LAYERWISE_PREFILL_BANK_COUNT,
+    MAX_ALLOCATION_GENERATION,
+    DSABlockAllocationMode,
+)
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -140,6 +145,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    layerwise_prefill_p_node_enabled,
 )
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -205,10 +211,70 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+    from vllm.v1.core.sched.output import (
+        CachedRequestData,
+        GrammarOutput,
+        SchedulerOutput,
+    )
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 logger = init_logger(__name__)
+
+
+def _validate_block_allocation_metadata(
+    block_ids: tuple[list[int], ...] | None,
+    block_ids_by_bank: tuple[tuple[list[int], ...], ...] | None,
+    allocation_mode: DSABlockAllocationMode | None,
+    allocation_generation: int | None,
+) -> None:
+    if allocation_mode != DSABlockAllocationMode.PREFILL_CHILD:
+        if block_ids_by_bank is not None or allocation_generation is not None:
+            raise RuntimeError(
+                "ordinary KV allocation carries PREFILL_CHILD bank or "
+                "generation metadata"
+            )
+        return
+    if block_ids is None or block_ids_by_bank is None:
+        raise RuntimeError("PREFILL_CHILD allocation is missing banked block IDs")
+    if allocation_generation is None:
+        raise RuntimeError("PREFILL_CHILD allocation is missing generation")
+    if not 0 < allocation_generation <= MAX_ALLOCATION_GENERATION:
+        raise RuntimeError(
+            "PREFILL_CHILD allocation_generation is outside uint64 range"
+        )
+    if len(block_ids_by_bank) != LAYERWISE_PREFILL_BANK_COUNT:
+        raise RuntimeError(
+            "PREFILL_CHILD allocation must have exactly two physical banks"
+        )
+    group_count = len(block_ids)
+    if any(len(bank_groups) != group_count for bank_groups in block_ids_by_bank):
+        raise RuntimeError("PREFILL_CHILD allocation has inconsistent group counts")
+    if any(
+        len(bank_group) != len(primary_group)
+        for bank_groups in block_ids_by_bank
+        for bank_group, primary_group in zip(bank_groups, block_ids)
+    ):
+        raise RuntimeError("PREFILL_CHILD allocation has inconsistent group lengths")
+    if block_ids_by_bank[0] != block_ids:
+        raise RuntimeError("primary KV block IDs differ from PREFILL_CHILD bank 0")
+
+
+def _validate_cached_block_allocation_metadata(
+    req_data: "CachedRequestData",
+) -> None:
+    expected = len(req_data.req_ids)
+    for field_name in (
+        "new_block_ids_by_bank",
+        "new_block_allocation_modes",
+        "allocation_generations",
+    ):
+        values = getattr(req_data, field_name)
+        if values is not None and len(values) != expected:
+            raise RuntimeError(
+                f"CachedRequestData.{field_name} has {len(values)} entries for "
+                f"{expected} requests"
+            )
+
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -402,6 +468,7 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self.layerwise_prefill_p_node = layerwise_prefill_p_node_enabled()
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -1026,6 +1093,16 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        if getattr(self, "layerwise_prefill_p_node", False):
+            raise RuntimeError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE allocator metadata is "
+                "enabled, but Stage 3 worker data-plane consumption is not "
+                "implemented; refusing execution before worker state update."
+            )
+        _validate_cached_block_allocation_metadata(
+            scheduler_output.scheduled_cached_reqs
+        )
+
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
@@ -1084,6 +1161,12 @@ class GPUModelRunner(
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
             req_id = new_req_data.req_id
+            _validate_block_allocation_metadata(
+                new_req_data.block_ids,
+                new_req_data.block_ids_by_bank,
+                new_req_data.block_allocation_mode,
+                new_req_data.allocation_generation,
+            )
             if req_id in self.requests:
                 # For streaming case only.
                 req_state = self._update_streaming_request(req_id, new_req_data)
@@ -1120,6 +1203,9 @@ class GPUModelRunner(
                 pooling_params=pooling_params,
                 generator=generator,
                 block_ids=new_req_data.block_ids,
+                block_ids_by_bank=new_req_data.block_ids_by_bank,
+                block_allocation_mode=new_req_data.block_allocation_mode,
+                allocation_generation=new_req_data.allocation_generation,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
@@ -1176,7 +1262,99 @@ class GPUModelRunner(
             req_state = self.requests[req_id]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
+            new_block_ids_by_bank = (
+                req_data.new_block_ids_by_bank[i]
+                if req_data.new_block_ids_by_bank is not None
+                else None
+            )
+            new_block_allocation_mode = (
+                req_data.new_block_allocation_modes[i]
+                if req_data.new_block_allocation_modes is not None
+                else None
+            )
+            allocation_generation = (
+                req_data.allocation_generations[i]
+                if req_data.allocation_generations is not None
+                else None
+            )
             resumed_from_preemption = req_id in req_data.resumed_req_ids
+            if (
+                new_block_ids is not None
+                or new_block_ids_by_bank is not None
+                or new_block_allocation_mode is not None
+            ):
+                _validate_block_allocation_metadata(
+                    new_block_ids,
+                    new_block_ids_by_bank,
+                    new_block_allocation_mode,
+                    allocation_generation,
+                )
+            elif (
+                allocation_generation is not None
+                and req_state.block_allocation_mode
+                != DSABlockAllocationMode.PREFILL_CHILD
+            ):
+                raise RuntimeError(
+                    "ordinary KV allocation carries PREFILL_CHILD generation metadata"
+                )
+            if resumed_from_preemption:
+                if req_state.block_allocation_mode != new_block_allocation_mode:
+                    raise RuntimeError(
+                        "resumed request changed KV block allocation mode"
+                    )
+                if (
+                    req_state.block_allocation_mode
+                    == DSABlockAllocationMode.PREFILL_CHILD
+                    and allocation_generation == req_state.allocation_generation
+                ):
+                    raise RuntimeError(
+                        "resumed PREFILL_CHILD request reused allocation_generation"
+                    )
+            else:
+                if (
+                    new_block_allocation_mode is not None
+                    and req_state.block_allocation_mode != new_block_allocation_mode
+                ):
+                    raise RuntimeError(
+                        "cached request changed KV block allocation mode"
+                    )
+                if (
+                    req_state.block_allocation_mode
+                    == DSABlockAllocationMode.PREFILL_CHILD
+                    and allocation_generation != req_state.allocation_generation
+                ):
+                    raise RuntimeError(
+                        "cached PREFILL_CHILD request changed or omitted "
+                        "allocation_generation"
+                    )
+                if (
+                    req_state.block_allocation_mode
+                    == DSABlockAllocationMode.PREFILL_CHILD
+                    and new_block_ids is not None
+                    and new_block_allocation_mode
+                    != DSABlockAllocationMode.PREFILL_CHILD
+                ):
+                    raise RuntimeError(
+                        "cached PREFILL_CHILD delta changed allocation mode"
+                    )
+                if new_block_ids_by_bank is not None:
+                    current_banks = req_state.block_ids_by_bank
+                    if current_banks is None:
+                        raise RuntimeError(
+                            "cached PREFILL_CHILD update has no worker bank state"
+                        )
+                    if len(current_banks) != len(new_block_ids_by_bank):
+                        raise RuntimeError(
+                            "cached PREFILL_CHILD request changed bank count"
+                        )
+                    group_count = len(req_state.block_ids)
+                    if any(
+                        len(bank_groups) != group_count for bank_groups in current_banks
+                    ):
+                        raise RuntimeError(
+                            "cached PREFILL_CHILD worker state has inconsistent "
+                            "group counts"
+                        )
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
@@ -1248,12 +1426,37 @@ class GPUModelRunner(
                     # Append the new blocks to the existing block IDs.
                     for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
                         block_ids.extend(new_ids)
+                if new_block_ids_by_bank is not None:
+                    if req_state.block_ids_by_bank is None:
+                        raise ValueError(
+                            "cached PREFILL_CHILD update has no worker bank state"
+                        )
+                    for bank_groups, new_bank_groups in zip(
+                        req_state.block_ids_by_bank, new_block_ids_by_bank
+                    ):
+                        for block_ids, new_ids in zip(bank_groups, new_bank_groups):
+                            block_ids.extend(new_ids)
             else:
                 assert req_index is None
                 assert new_block_ids is not None
                 # The request is resumed from preemption.
                 # Replace the existing block IDs with the new ones.
                 req_state.block_ids = new_block_ids
+                req_state.block_ids_by_bank = new_block_ids_by_bank
+
+            if new_block_allocation_mode is not None:
+                req_state.block_allocation_mode = new_block_allocation_mode
+            if allocation_generation is not None:
+                if (
+                    not resumed_from_preemption
+                    and req_state.allocation_generation
+                    not in (None, allocation_generation)
+                ):
+                    raise ValueError(
+                        "cached request changed allocation_generation without "
+                        "preemption"
+                    )
+                req_state.allocation_generation = allocation_generation
 
             if req_index is None:
                 # The request is not in the persistent batch.
@@ -1399,6 +1602,9 @@ class GPUModelRunner(
         req_state.pooling_params = new_req_data.pooling_params
         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
         req_state.block_ids = new_req_data.block_ids
+        req_state.block_ids_by_bank = new_req_data.block_ids_by_bank
+        req_state.block_allocation_mode = new_req_data.block_allocation_mode
+        req_state.allocation_generation = new_req_data.allocation_generation
         req_state.num_computed_tokens = new_req_data.num_computed_tokens
         req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
             req_state.prompt_token_ids, req_state.prompt_embeds
@@ -3242,6 +3448,12 @@ class GPUModelRunner(
 
     @contextmanager
     def synchronize_input_prep(self):
+        if getattr(self, "layerwise_prefill_p_node", False):
+            raise RuntimeError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE allocator metadata is "
+                "enabled, but Stage 3 worker data-plane consumption is not "
+                "implemented; refusing execution before worker state update."
+            )
         if self.prepare_inputs_event is None:
             yield
             return
@@ -3539,6 +3751,12 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if getattr(self, "layerwise_prefill_p_node", False):
+            raise RuntimeError(
+                "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE allocator metadata is "
+                "enabled, but Stage 3 worker data-plane consumption is not "
+                "implemented; refusing execution before worker state update."
+            )
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -4049,13 +4267,13 @@ class GPUModelRunner(
                 if self.kv_connector_output is None:
                     self.kv_connector_output = KVConnectorOutput()
                 for req_id, window_end in completed_decode_window_saves.items():
-                    self.kv_connector_output.completed_decode_window_saves[
-                        req_id
-                    ] = max(
-                        self.kv_connector_output.completed_decode_window_saves.get(
-                            req_id, 0
-                        ),
-                        window_end,
+                    self.kv_connector_output.completed_decode_window_saves[req_id] = (
+                        max(
+                            self.kv_connector_output.completed_decode_window_saves.get(
+                                req_id, 0
+                            ),
+                            window_end,
+                        )
                     )
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):

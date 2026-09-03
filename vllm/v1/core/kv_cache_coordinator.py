@@ -9,9 +9,11 @@ from math import lcm
 from vllm.logger import init_logger
 from vllm.v1.core.block_pool import BlockPool, DSASharedLogicalBlockPool
 from vllm.v1.core.dsa_shared_pool import (
+    LAYERWISE_PREFILL_BANK_COUNT,
     DSASharedBlockLayout,
     DSASharedBlockOwner,
     DSASharedBundleAllocator,
+    PrefillLayerBundlePool,
     dsa_block_pool_index,
     dsa_scratch_blocks_for_topk,
 )
@@ -21,6 +23,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     KVCacheBlock,
+    get_dsa_role_groups,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -35,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     dsa_shared_pool_enabled,
     dsa_two_groups_enabled,
+    layerwise_prefill_p_node_enabled,
 )
 from vllm.v1.request import Request
 
@@ -99,6 +103,23 @@ class KVCacheCoordinator(ABC):
             and len(kv_cache_config.kv_cache_groups) > 1
             and len(group_page_sizes) > 1
         )
+        self.layerwise_prefill_p_node = layerwise_prefill_p_node_enabled()
+        if self.layerwise_prefill_p_node:
+            if not self.use_dsa_shared_block_pool:
+                raise ValueError(
+                    "layerwise-prefill P-node mode requires DSA two-group "
+                    "shared-pool mode"
+                )
+            if enable_caching:
+                raise ValueError(
+                    "layerwise-prefill P-node mode requires prefix caching off"
+                )
+            if dcp_world_size != 1 or pcp_world_size != 1:
+                raise ValueError("layerwise-prefill P-node mode requires PCP=DCP=1")
+            if kv_cache_config.dsa_kv_topology is None:
+                raise ValueError(
+                    "layerwise-prefill P-node mode requires canonical DSA KV topology"
+                )
         assert not (
             (self.use_per_group_block_pools or self.use_dsa_shared_block_pool)
             and enable_caching
@@ -107,38 +128,52 @@ class KVCacheCoordinator(ABC):
             "caching yet; launch with --no-enable-prefix-caching."
         )
         if self.use_dsa_shared_block_pool:
-            latent_group = max(
+            latent_group, indexer_group = get_dsa_role_groups(
                 kv_cache_config.kv_cache_groups,
-                key=lambda g: g.kv_cache_spec.page_size_bytes,
-            )
-            indexer_group = min(
-                kv_cache_config.kv_cache_groups,
-                key=lambda g: g.kv_cache_spec.page_size_bytes,
+                kv_cache_config.dsa_kv_topology,
             )
             assert isinstance(latent_group.kv_cache_spec, MLAAttentionSpec)
             assert isinstance(indexer_group.kv_cache_spec, MLAAttentionSpec)
-            layout = DSASharedBlockLayout(
+            parent_layout = DSASharedBlockLayout(
                 latent_page_size_bytes=latent_group.kv_cache_spec.page_size_bytes,
                 indexer_page_size_bytes=indexer_group.kv_cache_spec.page_size_bytes,
                 capacity_bundles=kv_cache_config.num_blocks,
             )
-            self.dsa_shared_allocator = DSASharedBundleAllocator(layout)
+            parent_allocator = DSASharedBundleAllocator(parent_layout)
+            self.dsa_shared_parent_allocator = parent_allocator
             self.dsa_shared_num_layer_pairs = len(latent_group.layer_names)
+            if self.layerwise_prefill_p_node:
+                topology = kv_cache_config.dsa_kv_topology
+                assert topology is not None
+                num_physical_slots = len(topology.rows_by_group[0])
+                if num_physical_slots != len(latent_group.layer_names):
+                    raise ValueError(
+                        "layerwise-prefill physical slot count disagrees with "
+                        "the LATENT KV group"
+                    )
+                self.dsa_shared_allocator = PrefillLayerBundlePool(
+                    parent_allocator,
+                    num_physical_slots,
+                    bank_count=LAYERWISE_PREFILL_BANK_COUNT,
+                )
+            else:
+                self.dsa_shared_allocator = parent_allocator
+            layout = self.dsa_shared_allocator.layout
             self.block_pools = []
             for group in kv_cache_config.kv_cache_groups:
                 owner = (
                     DSASharedBlockOwner.LATENT
-                    if group.kv_cache_spec.page_size_bytes
-                    == latent_group.kv_cache_spec.page_size_bytes
+                    if group is latent_group
                     else DSASharedBlockOwner.INDEXER
                 )
                 self.block_pools.append(
                     DSASharedLogicalBlockPool(self.dsa_shared_allocator, owner)
                 )
             logger.info(
-                "DSA shared KV bundle pool: %d bundles, latent=%d blocks/bundle, "
-                "indexer=%d blocks/bundle.",
-                kv_cache_config.num_blocks,
+                "DSA shared KV bundle pool: mode=%s bundles=%d, latent=%d "
+                "blocks/bundle, indexer=%d blocks/bundle.",
+                "prefill_child" if self.layerwise_prefill_p_node else "full_parent",
+                layout.capacity_bundles,
                 layout.latent_blocks_per_bundle,
                 layout.indexer_blocks_per_bundle,
             )
@@ -273,12 +308,8 @@ class KVCacheCoordinator(ABC):
                     )
                 )
             else:
-                if dsa_compact_external_load and isinstance(
-                    manager, DSALatentManager
-                ):
-                    get_num_blocks = (
-                        manager.get_num_blocks_to_allocate_compact_external
-                    )
+                if dsa_compact_external_load and isinstance(manager, DSALatentManager):
+                    get_num_blocks = manager.get_num_blocks_to_allocate_compact_external
                 else:
                     get_num_blocks = manager.get_num_blocks_to_allocate
                 num_blocks_to_allocate.append(
@@ -315,7 +346,9 @@ class KVCacheCoordinator(ABC):
             dsa_compact_external_load,
         )
         if self.use_per_group_block_pools:
-            frees = [m.block_pool.get_num_free_blocks() for m in self.single_type_managers]
+            frees = [
+                m.block_pool.get_num_free_blocks() for m in self.single_type_managers
+            ]
             ok = all(needed <= free for needed, free in zip(per_group, frees))
             if not ok and (time.monotonic() - _last_starve_log[0]) > 1.0:
                 # [KVSTARVE] one-per-second snapshot of WHICH group blocked an
@@ -359,7 +392,7 @@ class KVCacheCoordinator(ABC):
                     needed_bundles,
                     self.dsa_shared_allocator.free_bundle_count,
                     per_group,
-            )
+                )
             return ok
         return sum(per_group) <= self.block_pool.get_num_free_blocks()
 
@@ -415,10 +448,9 @@ class KVCacheCoordinator(ABC):
                     if block.is_null:
                         continue
                     block_count += 1
-                    bundle_ids.add(
-                        layout.bundle_id_for_block(
-                            DSASharedBlockOwner.LATENT, block.block_id
-                        )
+                    bundle_ids.update(
+                        layout.bundle_id_for_block(DSASharedBlockOwner.LATENT, block_id)
+                        for block_id in block.bank_block_ids or (block.block_id,)
                     )
                 request = requests.get(request_id)
                 if request is None:
@@ -440,18 +472,19 @@ class KVCacheCoordinator(ABC):
                     if block.is_null:
                         continue
                     indexer_blocks += 1
-                    indexer_bundles.add(
+                    indexer_bundles.update(
                         layout.bundle_id_for_block(
-                            DSASharedBlockOwner.INDEXER, block.block_id
+                            DSASharedBlockOwner.INDEXER, block_id
                         )
+                        for block_id in block.bank_block_ids or (block.block_id,)
                     )
 
-        bundle_bytes = (
-            layout.bundle_page_size_bytes
-            * getattr(self, "dsa_shared_num_layer_pairs", 1)
-        )
+        bundle_bytes = layout.bundle_page_size_bytes
+        if not self.layerwise_prefill_p_node:
+            bundle_bytes *= getattr(self, "dsa_shared_num_layer_pairs", 1)
         used_gib = used * bundle_bytes / 2**30
-        total_gib = capacity * bundle_bytes / 2**30
+        total_bundle_slots = capacity + int(self.layerwise_prefill_p_node)
+        total_gib = total_bundle_slots * bundle_bytes / 2**30
 
         starve_req = "-"
         starve_need = 0
@@ -544,6 +577,7 @@ class KVCacheCoordinator(ABC):
         num_tokens_main_model: int,
         num_encoder_tokens: int = 0,
         dsa_compact_external_load: bool = False,
+        allocation_generation: int | None = None,
     ) -> tuple[list[KVCacheBlock], ...]:
         """
         Allocate new blocks for the request to give it at least `num_tokens`
@@ -562,21 +596,64 @@ class KVCacheCoordinator(ABC):
         Returns:
             The new allocated blocks.
         """
-        return tuple(
-            (
-                manager.allocate_new_blocks_compact_external
-                if dsa_compact_external_load
-                and isinstance(manager, DSALatentManager)
-                else manager.allocate_new_blocks
-            )(
-                request_id,
-                num_encoder_tokens
-                if isinstance(manager, CrossAttentionManager)
-                else num_tokens,
-                num_tokens_main_model,
-            )
-            for manager in self.single_type_managers
+        child_allocator = (
+            self.dsa_shared_allocator if self.layerwise_prefill_p_node else None
         )
+        if child_allocator is not None:
+            assert isinstance(child_allocator, PrefillLayerBundlePool)
+            if allocation_generation is None:
+                raise ValueError(
+                    "PREFILL_CHILD allocation requires allocation_generation"
+                )
+            child_allocator.begin_request_allocation(request_id, allocation_generation)
+
+        allocated: list[list[KVCacheBlock]] = []
+        request_block_counts = [
+            len(manager.req_to_blocks.get(request_id, ()))
+            for manager in self.single_type_managers
+        ]
+        try:
+            try:
+                for manager in self.single_type_managers:
+                    allocate = (
+                        manager.allocate_new_blocks_compact_external
+                        if dsa_compact_external_load
+                        and isinstance(manager, DSALatentManager)
+                        else manager.allocate_new_blocks
+                    )
+                    allocated.append(
+                        allocate(
+                            request_id,
+                            num_encoder_tokens
+                            if isinstance(manager, CrossAttentionManager)
+                            else num_tokens,
+                            num_tokens_main_model,
+                        )
+                    )
+            except BaseException:
+                if self.layerwise_prefill_p_node:
+                    for manager, old_count in reversed(
+                        list(zip(self.single_type_managers, request_block_counts))
+                    ):
+                        req_blocks = manager.req_to_blocks[request_id]
+                        new_blocks = req_blocks[old_count:]
+                        if not new_blocks:
+                            continue
+                        del req_blocks[old_count:]
+                        manager.block_pool.free_blocks(reversed(new_blocks))
+                    assert isinstance(child_allocator, PrefillLayerBundlePool)
+                    assert allocation_generation is not None
+                    child_allocator.rollback_request_allocation(
+                        request_id, allocation_generation
+                    )
+                raise
+            return tuple(allocated)
+        finally:
+            if child_allocator is not None:
+                assert allocation_generation is not None
+                child_allocator.end_request_allocation(
+                    request_id, allocation_generation
+                )
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """

@@ -34,6 +34,10 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
+from vllm.v1.core.dsa_shared_pool import (
+    MAX_ALLOCATION_GENERATION,
+    DSABlockAllocationMode,
+)
 from vllm.v1.core.encoder_cache_manager import (
     EncoderCacheManager,
     EncoderDecoderCacheManager,
@@ -58,6 +62,8 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     dsa_two_groups_enabled,
+    layerwise_prefill_p_node_enabled,
+    validate_layerwise_prefill_p_node,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
@@ -75,9 +81,9 @@ def _mtp_dw_diag_enabled() -> bool:
 
 
 def _mtp_dw_deep_diag_enabled() -> bool:
-    return _mtp_dw_diag_enabled() and os.getenv(
-        "VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0"
-    ) == "1"
+    return (
+        _mtp_dw_diag_enabled() and os.getenv("VLLM_ASCEND_MTP_DW_DEEP_DIAG", "0") == "1"
+    )
 
 
 def _mtp_dw_event(stage: str, **fields: Any) -> None:
@@ -134,9 +140,7 @@ def _mtp_dw_sample_deep_transition(
     return True
 
 
-def _mtp_dw_sample_deep_completion(
-    owner: Any, req_id: str, window_end: int
-) -> bool:
+def _mtp_dw_sample_deep_completion(owner: Any, req_id: str, window_end: int) -> bool:
     first_window_end = _mtp_dw_window_size()
     if (
         not _mtp_dw_deep_diag_enabled()
@@ -189,6 +193,10 @@ class Scheduler(SchedulerInterface):
         self.kv_cache_config = kv_cache_config
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
+        self.layerwise_prefill_p_node = layerwise_prefill_p_node_enabled()
+        validate_layerwise_prefill_p_node(vllm_config, kv_cache_config.dsa_kv_topology)
+        self._last_allocation_generation = 0
+        self._request_allocation_generations: dict[str, int] = {}
         self.log_stats = log_stats
         self.observability_config = vllm_config.observability_config
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
@@ -392,6 +400,41 @@ class Scheduler(SchedulerInterface):
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
+    def _get_or_create_allocation_generation(self, request_id: str) -> int | None:
+        if not self.layerwise_prefill_p_node:
+            return None
+        generation = self._request_allocation_generations.get(request_id)
+        if generation is not None:
+            return generation
+        if self._last_allocation_generation >= MAX_ALLOCATION_GENERATION:
+            raise OverflowError(
+                "layerwise-prefill allocation_generation exhausted uint64"
+            )
+        self._last_allocation_generation += 1
+        generation = self._last_allocation_generation
+        self._request_allocation_generations[request_id] = generation
+        return generation
+
+    def _allocation_generation_for_output(
+        self, request_id: str, blocks: KVCacheBlocks
+    ) -> int | None:
+        generation = self._request_allocation_generations.get(request_id)
+        block_generation = blocks.get_allocation_generation()
+        if block_generation is not None and block_generation != generation:
+            raise RuntimeError(
+                "scheduler allocation generation disagrees with allocated "
+                f"blocks: request_id={request_id!r}, scheduler={generation}, "
+                f"blocks={block_generation}"
+            )
+        if (
+            blocks.get_allocation_mode() == DSABlockAllocationMode.PREFILL_CHILD
+            and generation is None
+        ):
+            raise RuntimeError(
+                "PREFILL_CHILD scheduler output is missing allocation_generation"
+            )
+        return generation
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -556,11 +599,15 @@ class Scheduler(SchedulerInterface):
 
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
+                allocation_generation = self._get_or_create_allocation_generation(
+                    request.request_id
+                )
                 while True:
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
+                        allocation_generation=allocation_generation,
                     )
 
                     if new_blocks is not None:
@@ -844,6 +891,9 @@ class Scheduler(SchedulerInterface):
                     delay_cache_blocks=load_kv_async,
                     num_encoder_tokens=num_encoder_tokens,
                     dsa_compact_external_load=dsa_compact_external_load,
+                    allocation_generation=(
+                        self._get_or_create_allocation_generation(request_id)
+                    ),
                 )
 
                 if new_blocks is None:
@@ -919,9 +969,7 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
                 # Count the number of prefix cached tokens.
-                num_cached_tokens = min(
-                    num_computed_tokens, request.num_prompt_tokens
-                )
+                num_cached_tokens = min(num_computed_tokens, request.num_prompt_tokens)
                 if request.num_cached_tokens < 0:
                     request.num_cached_tokens = num_cached_tokens
                 elif num_external_computed_tokens > 0:
@@ -980,13 +1028,32 @@ class Scheduler(SchedulerInterface):
                     req,
                     req_to_new_blocks[req.request_id].get_block_ids(),
                     req._all_token_ids,
+                    block_ids_by_bank=req_to_new_blocks[
+                        req.request_id
+                    ].get_block_ids_by_bank(),
+                    block_allocation_mode=req_to_new_blocks[
+                        req.request_id
+                    ].get_allocation_mode(),
+                    allocation_generation=self._allocation_generation_for_output(
+                        req.request_id, req_to_new_blocks[req.request_id]
+                    ),
                 )
                 for req in scheduled_new_reqs
             ]
         else:
             new_reqs_data = [
                 NewRequestData.from_request(
-                    req, req_to_new_blocks[req.request_id].get_block_ids()
+                    req,
+                    req_to_new_blocks[req.request_id].get_block_ids(),
+                    block_ids_by_bank=req_to_new_blocks[
+                        req.request_id
+                    ].get_block_ids_by_bank(),
+                    block_allocation_mode=req_to_new_blocks[
+                        req.request_id
+                    ].get_allocation_mode(),
+                    allocation_generation=self._allocation_generation_for_output(
+                        req.request_id, req_to_new_blocks[req.request_id]
+                    ),
                 )
                 for req in scheduled_new_reqs
             ]
@@ -1065,6 +1132,7 @@ class Scheduler(SchedulerInterface):
             "Only running requests can be preempted"
         )
         self.kv_cache_manager.free(request)
+        self._request_allocation_generations.pop(request.request_id, None)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
@@ -1165,6 +1233,9 @@ class Scheduler(SchedulerInterface):
         req_ids: list[str] = []
         new_token_ids: list[list[int]] = []
         new_block_ids: list[tuple[list[int], ...] | None] = []
+        new_block_ids_by_bank: list[tuple[tuple[list[int], ...], ...] | None] = []
+        new_block_allocation_modes = []
+        allocation_generations: list[int | None] = []
         all_token_ids: dict[str, list[int]] = {}
         num_computed_tokens: list[int] = []
         num_output_tokens: list[int] = []
@@ -1199,6 +1270,17 @@ class Scheduler(SchedulerInterface):
             new_block_ids.append(
                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
             )
+            new_block_ids_by_bank.append(
+                req_to_new_blocks[req_id].get_block_ids_by_bank(allow_none=True)
+            )
+            new_block_allocation_modes.append(
+                req_to_new_blocks[req_id].get_allocation_mode()
+            )
+            allocation_generations.append(
+                self._allocation_generation_for_output(
+                    req_id, req_to_new_blocks[req_id]
+                )
+            )
             num_computed_tokens.append(req.num_computed_tokens)
             num_output_tokens.append(
                 req.num_output_tokens + req.num_output_placeholders
@@ -1212,6 +1294,9 @@ class Scheduler(SchedulerInterface):
             new_block_ids=new_block_ids,
             num_computed_tokens=num_computed_tokens,
             num_output_tokens=num_output_tokens,
+            new_block_ids_by_bank=new_block_ids_by_bank,
+            new_block_allocation_modes=new_block_allocation_modes,
+            allocation_generations=allocation_generations,
         )
 
     def _try_schedule_encoder_inputs(
@@ -1502,9 +1587,7 @@ class Scheduler(SchedulerInterface):
                         generated_token_ids
                     )
                     generated_ok = len(generated_token_ids) == num_accepted + 1
-                    rejected_ok = (
-                        num_rejected == num_draft_tokens - num_accepted
-                    )
+                    rejected_ok = num_rejected == num_draft_tokens - num_accepted
                     if (
                         _mtp_dw_sample_step(self, req_id, accepted_frontier)
                         or not generated_ok
@@ -1521,8 +1604,7 @@ class Scheduler(SchedulerInterface):
                             ],
                             generated_count=len(generated_token_ids),
                             generated_ids=[
-                                int(token_id)
-                                for token_id in generated_token_ids[:8]
+                                int(token_id) for token_id in generated_token_ids[:8]
                             ],
                             accepted_count=num_accepted,
                             rejected_count=num_rejected,
@@ -2018,9 +2100,7 @@ class Scheduler(SchedulerInterface):
             finish_reason = request.get_finished_reason()
             output_tokens = request.num_output_tokens
             raw_max_tokens = getattr(request, "max_tokens", None)
-            max_tokens = (
-                int(raw_max_tokens) if raw_max_tokens is not None else None
-            )
+            max_tokens = int(raw_max_tokens) if raw_max_tokens is not None else None
             status = request.status
             _mtp_dw_event(
                 "step",
@@ -2094,6 +2174,7 @@ class Scheduler(SchedulerInterface):
     def _free_blocks(self, request: Request):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
+        self._request_allocation_generations.pop(request.request_id, None)
         del self.requests[request.request_id]
 
     @property
@@ -2293,7 +2374,10 @@ class Scheduler(SchedulerInterface):
             # DSA two-group mode: group 0 is the MLA latent — the only group the
             # connector offloads (the indexer group stays NPU-resident), so
             # passing block_ids[0] to a non-HMA connector remains correct.
-            assert len(self.kv_cache_config.kv_cache_groups) == 1 or dsa_two_groups_enabled()
+            assert (
+                len(self.kv_cache_config.kv_cache_groups) == 1
+                or dsa_two_groups_enabled()
+            )
             return self.connector.request_finished(request, block_ids[0])
 
         return self.connector.request_finished_all_groups(request, block_ids)
@@ -2319,6 +2403,7 @@ class Scheduler(SchedulerInterface):
                 # No valid computed tokens, release allocated blocks.
                 # There may be a local cache hit on retry.
                 self.kv_cache_manager.free(request)
+                self._request_allocation_generations.pop(request.request_id, None)
 
             self.failed_recving_kv_req_ids.remove(request.request_id)
         else:
@@ -2402,9 +2487,10 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None:
             self.connector.update_connector_output(kv_connector_output)
 
-        for req_id, committed_end in (
-            kv_connector_output.completed_decode_window_saves.items()
-        ):
+        for (
+            req_id,
+            committed_end,
+        ) in kv_connector_output.completed_decode_window_saves.items():
             request = self.requests.get(req_id)
             if request is None:
                 if _mtp_dw_sample_deep_completion(self, req_id, committed_end):
@@ -2416,9 +2502,7 @@ class Scheduler(SchedulerInterface):
                         tp_rank=None,
                         tp_world=None,
                         frontier=None,
-                        window_start=max(
-                            0, int(committed_end) - _mtp_dw_window_size()
-                        ),
+                        window_start=max(0, int(committed_end) - _mtp_dw_window_size()),
                         window_end=int(committed_end),
                         kv_group=None,
                         request_present=False,
@@ -2449,9 +2533,7 @@ class Scheduler(SchedulerInterface):
                     tp_rank=None,
                     tp_world=None,
                     frontier=int(request.num_tokens),
-                    window_start=max(
-                        0, int(committed_end) - _mtp_dw_window_size()
-                    ),
+                    window_start=max(0, int(committed_end) - _mtp_dw_window_size()),
                     window_end=int(committed_end),
                     kv_group=None,
                     request_present=True,

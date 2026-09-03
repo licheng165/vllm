@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
 
+from vllm.v1.core.dsa_shared_pool import DSABlockAllocationMode
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -42,12 +44,20 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # P-node child allocation metadata.
+    block_ids_by_bank: tuple[tuple[list[int], ...], ...] | None = None
+    block_allocation_mode: DSABlockAllocationMode | None = None
+    allocation_generation: int | None = None
+
     @classmethod
     def from_request(
         cls,
         request: Request,
         block_ids: tuple[list[int], ...],
         prefill_token_ids: list[int] | None = None,
+        block_ids_by_bank: tuple[tuple[list[int], ...], ...] | None = None,
+        block_allocation_mode: DSABlockAllocationMode | None = None,
+        allocation_generation: int | None = None,
     ) -> "NewRequestData":
         return cls(
             req_id=request.request_id,
@@ -60,6 +70,9 @@ class NewRequestData:
             lora_request=request.lora_request,
             prompt_embeds=request.prompt_embeds,
             prefill_token_ids=prefill_token_ids,
+            block_ids_by_bank=block_ids_by_bank,
+            block_allocation_mode=block_allocation_mode,
+            allocation_generation=allocation_generation,
         )
 
     def __repr__(self) -> str:
@@ -74,6 +87,9 @@ class NewRequestData:
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
+            f"block_ids_by_bank={self.block_ids_by_bank},"
+            f"block_allocation_mode={self.block_allocation_mode},"
+            f"allocation_generation={self.allocation_generation},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
@@ -99,6 +115,9 @@ class NewRequestData:
             f"mm_features={self.mm_features},"
             f"sampling_params={self.sampling_params},"
             f"block_ids={self.block_ids},"
+            f"block_ids_by_bank={self.block_ids_by_bank},"
+            f"block_allocation_mode={self.block_allocation_mode},"
+            f"allocation_generation={self.allocation_generation},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"lora_request={self.lora_request},"
             f"prompt_embeds_shape={prompt_embeds_shape}"
@@ -122,6 +141,9 @@ class CachedRequestData:
     new_block_ids: list[tuple[list[int], ...] | None]
     num_computed_tokens: list[int]
     num_output_tokens: list[int]
+    new_block_ids_by_bank: list[tuple[tuple[list[int], ...], ...] | None] | None = None
+    new_block_allocation_modes: list[DSABlockAllocationMode | None] | None = None
+    allocation_generations: list[int | None] | None = None
 
     # Version of dataclass repr with token IDs obfuscated.
     def anon_repr(self) -> str:
@@ -136,6 +158,9 @@ class CachedRequestData:
             f"new_token_ids_lens={new_token_ids_lens},"
             f"all_token_ids_lens={all_token_ids_lens},"
             f"new_block_ids={self.new_block_ids},"
+            f"new_block_ids_by_bank={self.new_block_ids_by_bank},"
+            f"new_block_allocation_modes={self.new_block_allocation_modes},"
+            f"allocation_generations={self.allocation_generations},"
             f"num_computed_tokens={self.num_computed_tokens},"
             f"num_output_tokens={self.num_output_tokens}"
             f")"
