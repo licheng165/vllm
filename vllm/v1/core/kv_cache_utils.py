@@ -36,11 +36,16 @@ from vllm.v1.kv_cache_interface import (
     MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    DSAKVResidencyMode,
     dsa_shared_pool_enabled,
     dsa_shrink_stage,
     dsa_two_groups_enabled,
+    layerwise_dsa_residency_mode,
     layerwise_prefill_p_node_enabled,
+    sparse_decode_d_node_enabled,
+    validate_layerwise_dsa_node_modes,
     validate_layerwise_prefill_p_node,
+    validate_sparse_decode_d_node,
 )
 from vllm.v1.request import Request
 from vllm.v1.utils import tensor_data
@@ -1620,7 +1625,9 @@ def get_kv_cache_config_from_groups(
         int(getattr(vllm_config, "num_speculative_tokens", 0)), 0
     )
     dsa_sparse_rows = dsa_num_speculative_tokens + 1
+    validate_layerwise_dsa_node_modes()
     validate_layerwise_prefill_p_node(vllm_config, dsa_kv_topology)
+    validate_sparse_decode_d_node(vllm_config)
     if layerwise_prefill_p_node_enabled() and (
         len(kv_cache_groups) != 2
         or len({group.kv_cache_spec.page_size_bytes for group in kv_cache_groups}) != 2
@@ -1886,6 +1893,20 @@ def get_kv_cache_config_from_groups(
             sparse_decode_capacity = (
                 num_bundles // sparse_decode_bundles if sparse_decode_bundles else 0
             )
+            if sparse_decode_d_node_enabled():
+                if dsa_index_topk is None or sparse_decode_bundles == 0:
+                    raise ValueError(
+                        "DSA sparse decode D node requires index_topk and "
+                        "nonzero scratch bundles."
+                    )
+                if sparse_decode_capacity < 1:
+                    raise ValueError(
+                        "DSA sparse decode D node pool cannot hold one "
+                        f"max-length request: bundles={num_bundles}, "
+                        f"required={sparse_decode_bundles}, "
+                        f"max_model_len="
+                        f"{vllm_config.model_config.max_model_len}."
+                    )
             logger.info(
                 "DSA shared pool budget: gpu_memory_utilization=%s "
                 "kv_cache_memory_bytes=%s available_kv=%.2f GiB "
@@ -2450,38 +2471,11 @@ def _max_memory_usage_bytes_from_groups(
         and len({g.kv_cache_spec.page_size_bytes for g in kv_cache_groups}) > 1
     ):
         if dsa_shared_pool_enabled():
-            latent_group, indexer_group = get_dsa_role_groups(
-                kv_cache_groups, dsa_kv_topology
+            return dsa_residency_capacity_bytes(
+                vllm_config,
+                kv_cache_groups,
+                dsa_kv_topology,
             )
-            bundle_page = lcm(
-                latent_group.kv_cache_spec.page_size_bytes,
-                indexer_group.kv_cache_spec.page_size_bytes,
-            )
-            blocks = cdiv(
-                latent_group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
-                latent_group.kv_cache_spec.page_size_bytes,
-            )
-            bundles = cdiv(
-                blocks,
-                bundle_page // latent_group.kv_cache_spec.page_size_bytes,
-            ) + cdiv(
-                blocks,
-                bundle_page // indexer_group.kv_cache_spec.page_size_bytes,
-            )
-            if layerwise_prefill_p_node_enabled():
-                physical_slots = (
-                    len(dsa_kv_topology.rows_by_group[0])
-                    if dsa_kv_topology is not None
-                    else len(latent_group.layer_names)
-                )
-                parent_capacity = vllm_config.cache_config.num_gpu_blocks_override
-                if parent_capacity is None:
-                    parent_capacity = cdiv(
-                        LAYERWISE_PREFILL_BANK_COUNT * bundles,
-                        physical_slots,
-                    )
-                return (physical_slots * parent_capacity + 1) * bundle_page
-            return len(latent_group.layer_names) * (bundles + 1) * bundle_page
 
         total = 0
         for group in kv_cache_groups:
@@ -2500,6 +2494,99 @@ def _max_memory_usage_bytes_from_groups(
     blocks_needed = cdiv(any_spec.max_memory_usage_bytes(vllm_config), page_size)
 
     return group_size * page_size * blocks_needed
+
+
+def dsa_residency_capacity_bytes(
+    vllm_config: VllmConfig,
+    kv_cache_groups: list[KVCacheGroupSpec],
+    dsa_kv_topology: DSAKVTopology | None = None,
+) -> int:
+    """Unified residency capacity formula for the DSA shared pool.
+
+    Estimate, startup check, capacity report, and scheduler admission must
+    all use this one helper so the three residency formulas cannot drift:
+
+    FULL_RESIDENT:
+      L * (q_latent + q_indexer + 1) * B
+    PREFILL_LAYERWISE:
+      (L * C + 1) * B, with L*C >= 2*(q_latent + q_indexer)
+    DECODE_SPARSE_EXTERNAL:
+      L * (q_scratch_latent + q_indexer + 1) * B
+    """
+    latent_group, indexer_group = get_dsa_role_groups(
+        kv_cache_groups, dsa_kv_topology
+    )
+    latent_layers = len(latent_group.layer_names)
+    latent_page = latent_group.kv_cache_spec.page_size_bytes
+    indexer_page = indexer_group.kv_cache_spec.page_size_bytes
+    bundle_page = lcm(latent_page, indexer_page)
+    latent_blocks_per_bundle = bundle_page // latent_page
+    indexer_blocks_per_bundle = bundle_page // indexer_page
+
+    full_latent_blocks = cdiv(
+        latent_group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+        latent_page,
+    )
+    full_indexer_blocks = cdiv(
+        indexer_group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+        indexer_page,
+    )
+    full_bundles = cdiv(
+        full_latent_blocks, latent_blocks_per_bundle
+    ) + cdiv(full_indexer_blocks, indexer_blocks_per_bundle)
+
+    mode = layerwise_dsa_residency_mode()
+    if mode is DSAKVResidencyMode.PREFILL_LAYERWISE:
+        physical_slots = (
+            len(dsa_kv_topology.rows_by_group[0])
+            if dsa_kv_topology is not None
+            else latent_layers
+        )
+        parent_capacity = vllm_config.cache_config.num_gpu_blocks_override
+        if parent_capacity is None:
+            parent_capacity = cdiv(
+                LAYERWISE_PREFILL_BANK_COUNT * full_bundles,
+                physical_slots,
+            )
+        return (physical_slots * parent_capacity + 1) * bundle_page
+
+    if mode is DSAKVResidencyMode.DECODE_SPARSE_EXTERNAL:
+        hf_config = getattr(vllm_config.model_config, "hf_text_config", None)
+        if hf_config is None:
+            hf_config = getattr(vllm_config.model_config, "hf_config", None)
+        dsa_index_topk = getattr(hf_config, "index_topk", None)
+        if dsa_index_topk is None:
+            raise ValueError(
+                "DSA sparse decode D node requires index_topk from the model "
+                "config."
+            )
+        if int(dsa_index_topk) % latent_group.kv_cache_spec.block_size:
+            raise ValueError(
+                "DSA index_topk must be an integer multiple of block_size: "
+                f"index_topk={dsa_index_topk}, "
+                f"block_size={latent_group.kv_cache_spec.block_size}"
+            )
+        dsa_num_speculative_tokens = max(
+            int(getattr(vllm_config, "num_speculative_tokens", 0)), 0
+        )
+        dsa_sparse_rows = dsa_num_speculative_tokens + 1
+        scratch_blocks = (
+            int(dsa_index_topk)
+            * dsa_sparse_rows
+            // latent_group.kv_cache_spec.block_size
+        )
+        scratch_bundles = cdiv(scratch_blocks, latent_blocks_per_bundle)
+        return (
+            latent_layers
+            * (
+                scratch_bundles
+                + cdiv(full_indexer_blocks, indexer_blocks_per_bundle)
+                + 1
+            )
+            * bundle_page
+        )
+
+    return latent_layers * (full_bundles + 1) * bundle_page
 
 
 def _estimate_max_model_len_from_groups(

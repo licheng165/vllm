@@ -18,6 +18,7 @@ from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinatorNoPrefixCache
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import (
     build_dsa_kv_topology,
+    dsa_residency_capacity_bytes,
     generate_scheduler_kv_cache_config,
     get_dsa_role_groups,
     get_kv_cache_config_from_groups,
@@ -29,13 +30,17 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     DSAKVRegistration,
+    DSAKVResidencyMode,
     DSAKVRow,
     KVCacheConfig,
     KVCacheGroupSpec,
     KVCacheTensor,
     MLAAttentionSpec,
+    layerwise_dsa_residency_mode,
     layerwise_prefill_p_node_enabled,
+    validate_layerwise_dsa_node_modes,
     validate_layerwise_prefill_p_node,
+    validate_sparse_decode_d_node,
 )
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
 from vllm.v1.worker.gpu_model_runner import (
@@ -423,6 +428,79 @@ def test_global_slab_capacity_boundaries_and_reconciliation(monkeypatch):
     assert (
         scheduler_config.kv_cache_tensors[0].size == (79 * 121 + 1) * _BUNDLE_PAGE_BYTES
     )
+
+
+def test_d_node_sparse_capacity_separated_from_full_resident(monkeypatch):
+    groups, topology, _ = _glm52_groups_and_topology()
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "true")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_UNBUNDLE", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "2")
+    vllm_config = _vllm_config(0, max_model_len=1_000_000)
+    vllm_config.cache_config.num_gpu_blocks_override = None
+    vllm_config.num_speculative_tokens = 1
+
+    assert layerwise_dsa_residency_mode() is DSAKVResidencyMode.DECODE_SPARSE_EXTERNAL
+    bytes_d = dsa_residency_capacity_bytes(vllm_config, groups, topology)
+    # 79 * (scratch 16 + indexer 869 + null 1) * bundle page = 19.224 GiB.
+    assert bytes_d == 79 * (16 + 869 + 1) * _BUNDLE_PAGE_BYTES
+    assert bytes_d / 2**30 == pytest.approx(19.224, abs=0.001)
+
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "false")
+    assert layerwise_dsa_residency_mode() is DSAKVResidencyMode.FULL_RESIDENT
+    bytes_full = dsa_residency_capacity_bytes(vllm_config, groups, topology)
+    assert bytes_full > bytes_d
+    assert bytes_full == 79 * (4776 + 1) * _BUNDLE_PAGE_BYTES
+
+
+def test_d_node_rejects_pools_smaller_than_one_max_length_request(monkeypatch):
+    groups, topology, _ = _glm52_groups_and_topology()
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "true")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_UNBUNDLE", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "2")
+    vllm_config = _vllm_config(0, max_model_len=1_000_000)
+    vllm_config.cache_config.num_gpu_blocks_override = None
+    vllm_config.num_speculative_tokens = 1
+
+    # One bundle slot short of 885 usable bundles: the pool must reject
+    # instead of silently dense-prefilling one max-length request.
+    slots = 884
+    with pytest.raises(ValueError, match="cannot hold one max-length request"):
+        get_kv_cache_config_from_groups(
+            vllm_config,
+            groups,
+            available_memory=79 * slots * _BUNDLE_PAGE_BYTES,
+            dsa_kv_topology=topology,
+        )
+
+    config = get_kv_cache_config_from_groups(
+        vllm_config,
+        groups,
+        available_memory=79 * 886 * _BUNDLE_PAGE_BYTES,
+        dsa_kv_topology=topology,
+    )
+    assert config.num_blocks == 885
+
+
+def test_node_modes_are_mutually_exclusive_and_validated(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "true")
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        validate_layerwise_dsa_node_modes()
+
+    monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "false")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "true")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_UNBUNDLE", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHARED_POOL", "1")
+    monkeypatch.setenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0")
+    with pytest.raises(ValueError, match="DSA_SHRINK_LATENT=2"):
+        validate_sparse_decode_d_node(_vllm_config(0))
 
 
 @pytest.mark.parametrize("failing_leg", range(1, 5))

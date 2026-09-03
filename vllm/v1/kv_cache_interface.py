@@ -4,6 +4,7 @@
 import copy
 import os
 from dataclasses import dataclass, field, fields, replace
+from enum import Enum
 from math import prod
 
 import torch
@@ -28,6 +29,89 @@ def layerwise_prefill_p_node_enabled() -> bool:
     raise ValueError(
         f"VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE must be 'true' or 'false', got {raw!r}"
     )
+
+
+def sparse_decode_d_node_enabled() -> bool:
+    """Whether this process is explicitly configured as a sparse D node."""
+    raw = os.getenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "false")
+    normalized = raw.strip().lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise ValueError(
+        "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE must be 'true' or 'false', "
+        f"got {raw!r}"
+    )
+
+
+class DSAKVResidencyMode(str, Enum):
+    """Explicit node residency mode; never inferred from role or model."""
+
+    FULL_RESIDENT = "full_resident"
+    PREFILL_LAYERWISE = "prefill_layerwise"
+    DECODE_SPARSE_EXTERNAL = "decode_sparse_external"
+
+
+def layerwise_dsa_residency_mode() -> DSAKVResidencyMode:
+    """Return the configured node residency mode.
+
+    The two explicit node modes are mutually exclusive and validated by
+    :func:`validate_layerwise_dsa_node_modes`; any other configuration is
+    full resident. Node identity is never derived from kv_role, IP, port,
+    or model name.
+    """
+    if layerwise_prefill_p_node_enabled():
+        return DSAKVResidencyMode.PREFILL_LAYERWISE
+    if sparse_decode_d_node_enabled():
+        return DSAKVResidencyMode.DECODE_SPARSE_EXTERNAL
+    return DSAKVResidencyMode.FULL_RESIDENT
+
+
+def validate_layerwise_dsa_node_modes() -> None:
+    """Fail closed when both explicit node modes are configured at once."""
+    if (
+        layerwise_prefill_p_node_enabled()
+        and sparse_decode_d_node_enabled()
+    ):
+        raise ValueError(
+            "VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE and "
+            "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE are mutually exclusive."
+        )
+
+
+def validate_sparse_decode_d_node(vllm_config: VllmConfig) -> None:
+    """Validate the closed set of prerequisites for the sparse D node."""
+    if not sparse_decode_d_node_enabled():
+        return
+
+    failures: list[str] = []
+    if layerwise_prefill_p_node_enabled():
+        failures.append("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE=false")
+    if not dsa_unbundle_enabled():
+        failures.append("VLLM_ASCEND_DSA_UNBUNDLE=1")
+    if not dsa_two_groups_enabled():
+        failures.append("VLLM_ASCEND_DSA_TWO_GROUPS=1")
+    if os.getenv("VLLM_ASCEND_DSA_SHARED_POOL") != "1":
+        failures.append("VLLM_ASCEND_DSA_SHARED_POOL=1")
+    if os.getenv("VLLM_ASCEND_DSA_SHRINK_LATENT", "0") != "2":
+        failures.append("VLLM_ASCEND_DSA_SHRINK_LATENT=2")
+    if vllm_config.cache_config.enable_prefix_caching:
+        failures.append("enable_prefix_caching=false")
+
+    parallel_config = vllm_config.parallel_config
+    if parallel_config.pipeline_parallel_size != 1:
+        failures.append("pipeline_parallel_size=1")
+    if parallel_config.prefill_context_parallel_size != 1:
+        failures.append("prefill_context_parallel_size=1")
+    if parallel_config.decode_context_parallel_size != 1:
+        failures.append("decode_context_parallel_size=1")
+
+    if failures:
+        raise ValueError(
+            "VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE=true requires: "
+            + ", ".join(failures)
+        )
 
 
 def dsa_unbundle_enabled() -> bool:
