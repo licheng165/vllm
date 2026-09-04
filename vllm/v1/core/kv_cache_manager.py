@@ -443,6 +443,7 @@ class KVCacheManager:
                 num_local_computed_tokens=num_local_computed_tokens,
                 num_external_computed_tokens=num_external_computed_tokens,
                 dsa_compact_external_load=dsa_compact_external_load,
+                allocation_generation=allocation_generation,
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(

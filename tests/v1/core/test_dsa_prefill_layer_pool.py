@@ -654,6 +654,31 @@ def test_failed_chunk_extension_preserves_committed_children(monkeypatch):
     )
 
 
+def test_external_prefix_allocation_uses_request_context(monkeypatch):
+    coordinator = _make_glm52_coordinator(monkeypatch)
+
+    coordinator.allocate_new_computed_blocks(
+        "req",
+        new_computed_blocks=((), ()),
+        num_local_computed_tokens=0,
+        num_external_computed_tokens=6,
+        allocation_generation=9,
+    )
+
+    allocation = KVCacheBlocks(
+        tuple(
+            manager.req_to_blocks["req"]
+            for manager in coordinator.single_type_managers
+        )
+    )
+    assert allocation.get_allocation_mode() == DSABlockAllocationMode.PREFILL_CHILD
+    assert allocation.get_allocation_generation() == 9
+    assert allocation.get_block_ids_by_bank() is not None
+
+    coordinator.free("req")
+    assert coordinator.dsa_shared_parent_allocator.free_bundle_count == 1
+
+
 def test_scheduler_generation_is_monotonic_across_request_id_reuse():
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.layerwise_prefill_p_node = True

@@ -3,7 +3,8 @@
 import os
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from math import lcm
 
 from vllm.logger import init_logger
@@ -544,6 +545,7 @@ class KVCacheCoordinator(ABC):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
         dsa_compact_external_load: bool = False,
+        allocation_generation: int | None = None,
     ) -> None:
         """
         Add the new computed blocks to the request. Optionally allocate new
@@ -556,18 +558,82 @@ class KVCacheCoordinator(ABC):
             num_local_computed_tokens: The number of local computed tokens.
             num_external_computed_tokens: The number of external computed tokens.
         """
-        for i, manager in enumerate(self.single_type_managers):
-            if dsa_compact_external_load and isinstance(manager, DSALatentManager):
-                allocate_computed = (
-                    manager.allocate_new_computed_blocks_compact_external
+        with self._request_allocation_context(
+            request_id, allocation_generation
+        ):
+            for i, manager in enumerate(self.single_type_managers):
+                if dsa_compact_external_load and isinstance(
+                    manager, DSALatentManager
+                ):
+                    allocate_computed = (
+                        manager.allocate_new_computed_blocks_compact_external
+                    )
+                else:
+                    allocate_computed = manager.allocate_new_computed_blocks
+                allocate_computed(
+                    request_id,
+                    new_computed_blocks[i],
+                    num_local_computed_tokens,
+                    num_external_computed_tokens,
                 )
-            else:
-                allocate_computed = manager.allocate_new_computed_blocks
-            allocate_computed(
-                request_id,
-                new_computed_blocks[i],
-                num_local_computed_tokens,
-                num_external_computed_tokens,
+
+    @contextmanager
+    def _request_allocation_context(
+        self,
+        request_id: str,
+        allocation_generation: int | None,
+    ) -> Iterator[None]:
+        child_allocator = (
+            self.dsa_shared_allocator if self.layerwise_prefill_p_node else None
+        )
+        if child_allocator is None:
+            yield
+            return
+
+        assert isinstance(child_allocator, PrefillLayerBundlePool)
+        if allocation_generation is None:
+            raise ValueError(
+                "PREFILL_CHILD allocation requires allocation_generation"
+            )
+        child_allocator.begin_request_allocation(
+            request_id, allocation_generation
+        )
+        request_block_counts = [
+            len(manager.req_to_blocks.get(request_id, ()))
+            for manager in self.single_type_managers
+        ]
+        cached_block_counts = [
+            manager.num_cached_block.get(request_id)
+            for manager in self.single_type_managers
+        ]
+        try:
+            yield
+        except BaseException:
+            for manager, old_count, old_cached_count in reversed(
+                list(
+                    zip(
+                        self.single_type_managers,
+                        request_block_counts,
+                        cached_block_counts,
+                    )
+                )
+            ):
+                req_blocks = manager.req_to_blocks[request_id]
+                new_blocks = req_blocks[old_count:]
+                if new_blocks:
+                    del req_blocks[old_count:]
+                    manager.block_pool.free_blocks(reversed(new_blocks))
+                if old_cached_count is None:
+                    manager.num_cached_block.pop(request_id, None)
+                else:
+                    manager.num_cached_block[request_id] = old_cached_count
+            child_allocator.rollback_request_allocation(
+                request_id, allocation_generation
+            )
+            raise
+        finally:
+            child_allocator.end_request_allocation(
+                request_id, allocation_generation
             )
 
     def allocate_new_blocks(
@@ -596,64 +662,27 @@ class KVCacheCoordinator(ABC):
         Returns:
             The new allocated blocks.
         """
-        child_allocator = (
-            self.dsa_shared_allocator if self.layerwise_prefill_p_node else None
-        )
-        if child_allocator is not None:
-            assert isinstance(child_allocator, PrefillLayerBundlePool)
-            if allocation_generation is None:
-                raise ValueError(
-                    "PREFILL_CHILD allocation requires allocation_generation"
-                )
-            child_allocator.begin_request_allocation(request_id, allocation_generation)
-
         allocated: list[list[KVCacheBlock]] = []
-        request_block_counts = [
-            len(manager.req_to_blocks.get(request_id, ()))
-            for manager in self.single_type_managers
-        ]
-        try:
-            try:
-                for manager in self.single_type_managers:
-                    allocate = (
-                        manager.allocate_new_blocks_compact_external
-                        if dsa_compact_external_load
-                        and isinstance(manager, DSALatentManager)
-                        else manager.allocate_new_blocks
-                    )
-                    allocated.append(
-                        allocate(
-                            request_id,
-                            num_encoder_tokens
-                            if isinstance(manager, CrossAttentionManager)
-                            else num_tokens,
-                            num_tokens_main_model,
-                        )
-                    )
-            except BaseException:
-                if self.layerwise_prefill_p_node:
-                    for manager, old_count in reversed(
-                        list(zip(self.single_type_managers, request_block_counts))
-                    ):
-                        req_blocks = manager.req_to_blocks[request_id]
-                        new_blocks = req_blocks[old_count:]
-                        if not new_blocks:
-                            continue
-                        del req_blocks[old_count:]
-                        manager.block_pool.free_blocks(reversed(new_blocks))
-                    assert isinstance(child_allocator, PrefillLayerBundlePool)
-                    assert allocation_generation is not None
-                    child_allocator.rollback_request_allocation(
-                        request_id, allocation_generation
-                    )
-                raise
-            return tuple(allocated)
-        finally:
-            if child_allocator is not None:
-                assert allocation_generation is not None
-                child_allocator.end_request_allocation(
-                    request_id, allocation_generation
+        with self._request_allocation_context(
+            request_id, allocation_generation
+        ):
+            for manager in self.single_type_managers:
+                allocate = (
+                    manager.allocate_new_blocks_compact_external
+                    if dsa_compact_external_load
+                    and isinstance(manager, DSALatentManager)
+                    else manager.allocate_new_blocks
                 )
+                allocated.append(
+                    allocate(
+                        request_id,
+                        num_encoder_tokens
+                        if isinstance(manager, CrossAttentionManager)
+                        else num_tokens,
+                        num_tokens_main_model,
+                    )
+                )
+        return tuple(allocated)
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         """
