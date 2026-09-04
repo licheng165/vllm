@@ -5855,12 +5855,20 @@ class GPUModelRunner(
 
     def _init_minimal_kv_cache_for_profiling(self) -> None:
         from vllm.v1.core.kv_cache_utils import (
+            build_dsa_kv_topology,
             get_kv_cache_config_from_groups,
             get_kv_cache_groups,
         )
+        from vllm.v1.kv_cache_interface import dsa_two_groups_enabled
 
         kv_cache_spec = self.get_kv_cache_spec()
         kv_cache_groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        dsa_kv_topology = None
+        if dsa_two_groups_enabled() and any(
+            spec.dsa_kv_registration is not None
+            for spec in kv_cache_spec.values()
+        ):
+            dsa_kv_topology = build_dsa_kv_topology(kv_cache_spec)
         min_blocks = self.compilation_config.max_cudagraph_capture_size or 1
 
         # Temporarily change num_gpu_blocks_override to allocate a minimal KV cache
@@ -5870,6 +5878,7 @@ class GPUModelRunner(
             self.vllm_config,
             kv_cache_groups,
             available_memory=0,
+            dsa_kv_topology=dsa_kv_topology,
             for_minimal_profile=True,
         )
         self.cache_config.num_gpu_blocks_override = saved_override

@@ -541,6 +541,26 @@ def test_minimal_profiling_config_skips_admission_gates(monkeypatch):
     assert p_minimal.num_blocks == 1
 
 
+def test_minimal_profiling_config_preserves_dsa_topology(monkeypatch):
+    _, topology, specs = _glm52_groups_and_topology()
+    monkeypatch.setenv("VLLM_ASCEND_DSA_TWO_GROUPS", "1")
+    vllm_config = _vllm_config(0, max_model_len=179_840)
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = vllm_config
+    runner.cache_config = vllm_config.cache_config
+    runner.compilation_config = SimpleNamespace(max_cudagraph_capture_size=64)
+    runner.get_kv_cache_spec = lambda: specs
+    observed = []
+    runner.initialize_kv_cache = observed.append
+
+    runner._init_minimal_kv_cache_for_profiling()
+
+    assert len(observed) == 1
+    assert observed[0].dsa_kv_topology is not None
+    assert observed[0].dsa_kv_topology.signature == topology.signature
+    assert observed[0].num_blocks == 64
+
+
 def test_node_modes_are_mutually_exclusive_and_validated(monkeypatch):
     monkeypatch.setenv("VLLM_ASCEND_LAYERWISE_PREFILL_P_NODE", "true")
     monkeypatch.setenv("VLLM_ASCEND_DSA_SPARSE_DECODE_D_NODE", "true")
